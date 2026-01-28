@@ -1,12 +1,37 @@
 """
-Post IPO Daily Monitoring - Utilities
-로깅 설정 유틸리티
+Post IPO Monitor - Utilities
+유틸리티 함수
 """
 import logging
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from .config import Config
+
+
+def print_progress_bar(current: int, total: int, prefix: str = '', length: int = 40):
+    """진행률 바 출력"""
+    percent = current / total
+    filled = int(length * percent)
+    bar = '█' * filled + '░' * (length - filled)
+    sys.stdout.write(f'\r  {prefix} [{bar}] {current}/{total}')
+    sys.stdout.flush()
+    if current == total:
+        print()  # 완료 시 줄바꿈
+
+
+def get_previous_business_day(config: Config = None) -> datetime:
+    """전 영업일 계산 (주말 + 공휴일 제외)"""
+    config = config or Config()
+    today = datetime.now()
+    prev_day = today - timedelta(days=1)
+
+    # 주말 또는 공휴일이면 건너뛰기
+    while (prev_day.weekday() >= 5 or
+           prev_day.strftime('%Y-%m-%d') in config.KR_HOLIDAYS):
+        prev_day -= timedelta(days=1)
+
+    return prev_day
 
 
 def setup_logging(

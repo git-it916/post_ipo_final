@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Post IPO Screener - Main Entry Point
-=====================================
-2년 이내 신규상장 종목 스크리닝
+Post IPO Monitor - Main Entry Point
+====================================
+2년 이내 신규상장 종목 모니터링
 
 실행:
     python run.py
@@ -13,8 +13,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from screen_ipo import IPOScreener, ScreenerConfig
-from post_ipo_daily import setup_logging
+from screen_ipo import IPOMonitor
+from post_ipo_daily import Config, setup_logging
 
 
 def main():
@@ -22,22 +22,18 @@ def main():
     setup_logging()
 
     print("=" * 60)
-    print("       Post IPO Screener")
-    print("       (2년 이내 신규 상장주)")
+    print("Post IPO Monitor")
+    print("2년 이내 신규 상장주)")
     print("=" * 60)
 
-    config = ScreenerConfig(
-        IPO_DAYS_LIMIT=730,
-        TOP_N_RESULTS=20,
-    )
-
-    screener = IPOScreener(config)
-    result = screener.run()
+    config = Config()
+    monitor = IPOMonitor(config)
+    result = monitor.run()
 
     if result is not None and not result.empty:
-        print(f"\n총 {len(result)}개 종목 스크리닝 완료")
+        print(f"\n모니터링 완료: {len(result)}개 종목")
     else:
-        print("\n스크리닝 결과가 없습니다.")
+        print("\n모니터링 결과가 없습니다.")
 
 
 if __name__ == "__main__":

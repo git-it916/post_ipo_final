@@ -341,6 +341,9 @@ class IPOMonitor:
                 df['px_volume'] / df['volume_avg_20d']
             ).round(2)
 
+        # 전일 RSI 가져오기
+        df = self._fetch_previous_rsi(df, tickers, ref_date)
+
         # 10일선 돌파 여부
         if 'px_last' in df.columns and 'mov_avg_10d' in df.columns:
             df['above_ma10'] = (df['px_last'] > df['mov_avg_10d']).astype(int)
@@ -353,6 +356,50 @@ class IPOMonitor:
         self._save_bloomberg_raw_data(ref_date_str)
 
         return self._bloomberg_df
+
+    def _fetch_previous_rsi(self, df: pd.DataFrame, tickers: list, ref_date) -> pd.DataFrame:
+        """전일 RSI를 가져와서 RSI 변화량 계산"""
+        from xbbg import blp
+
+        # 전일(T-2) 날짜 계산
+        prev_date = ref_date - pd.Timedelta(days=1)
+        # 주말/공휴일 처리
+        while prev_date.strftime('%Y-%m-%d') in self.config.KR_HOLIDAYS or prev_date.weekday() >= 5:
+            prev_date = prev_date - pd.Timedelta(days=1)
+
+        prev_date_str = prev_date.strftime('%Y-%m-%d')
+
+        try:
+            print(f"\n  전일 RSI 수집 중 ({prev_date_str})...")
+            prev_rsi = blp.bdh(tickers, 'RSI_14D', prev_date_str, prev_date_str)
+
+            if prev_rsi.empty:
+                print("    전일 RSI 데이터 없음")
+                return df
+
+            # 멀티인덱스 처리
+            if prev_rsi.columns.nlevels > 1:
+                prev_rsi_flat = prev_rsi.iloc[0].unstack(level=0)
+                if isinstance(prev_rsi_flat, pd.DataFrame):
+                    prev_rsi_series = prev_rsi_flat.iloc[:, 0]
+                else:
+                    prev_rsi_series = prev_rsi_flat
+            else:
+                prev_rsi_series = prev_rsi.iloc[0]
+
+            # 전일 RSI 컬럼 추가
+            df['rsi_prev'] = df.index.map(lambda x: prev_rsi_series.get(x, None))
+
+            # RSI 변화량 계산 (당일 RSI - 전일 RSI)
+            if 'rsi_14d' in df.columns:
+                df['rsi_change'] = (df['rsi_14d'] - df['rsi_prev']).round(1)
+
+            print(f"    전일 RSI 수집 완료")
+
+        except Exception as e:
+            print(f"    전일 RSI 수집 오류: {e}")
+
+        return df
 
     def _save_bloomberg_raw_data(self, ref_date_str: str):
         """Bloomberg 원본 데이터를 Excel로 저장"""
@@ -401,8 +448,8 @@ class IPOMonitor:
             bbg['코드'] = 'A' + bbg['ticker'].str.split(' ').str[0]
 
             bbg_cols = ['코드', 'px_last', 'px_volume', 'volume_avg_20d', 'rvol_20',
-                        'volatility_30d', 'rsi_14d', 'chg_pct_1d', 'chg_pct_20d',
-                        'mov_avg_10d', 'above_ma10']
+                        'volatility_30d', 'rsi_14d', 'rsi_prev', 'rsi_change',
+                        'chg_pct_1d', 'chg_pct_20d', 'mov_avg_10d', 'above_ma10']
             bbg_cols = [c for c in bbg_cols if c in bbg.columns]
 
             result = result.merge(bbg[bbg_cols], on='코드', how='left')
@@ -415,6 +462,8 @@ class IPOMonitor:
             'rvol_20': 'RVOL(20)',
             'volatility_30d': '변동성(30D)',
             'rsi_14d': 'RSI(14)',
+            'rsi_prev': '전일RSI(14)',
+            'rsi_change': 'RSI변화량',
             'chg_pct_1d': '1일수익률(%)',
             'chg_pct_20d': '20일수익률(%)',
             'mov_avg_10d': '10일이평',
@@ -579,13 +628,12 @@ class IPOMonitor:
             return None
 
         top = df.nlargest(self.config.TOP_N_RESULTS, '종합스코어').copy()
-        top['순위'] = range(1, len(top) + 1)
 
         display_cols = [
-            '순위', '등급', '코드', '코드명', '상장일', '현재가',
+            '코드', '코드명', '상장일', '현재가',
             '종합스코어', '모멘텀스코어', '수급스코어', '거래량스코어',
-            '20일수익률(%)', '10일선돌파', 'RSI(14)',
-            '기관_일간', '외국인_일간', 'RVOL(20)', '변동성(30D)'
+            'RSI변화량', 'RSI(14)', '전일RSI(14)',
+            'RVOL(20)', '기관_일간', '외국인_일간', '10일선돌파', '변동성(30D)'
         ]
         display_cols = [c for c in display_cols if c in top.columns]
 

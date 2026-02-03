@@ -349,7 +349,28 @@ class IPOMonitor:
 
         print(f"\nBloomberg 데이터: {len(df)}개 종목 (기준일: {ref_date_str})")
 
+        # Bloomberg 원본 데이터 저장
+        self._save_bloomberg_raw_data(ref_date_str)
+
         return self._bloomberg_df
+
+    def _save_bloomberg_raw_data(self, ref_date_str: str):
+        """Bloomberg 원본 데이터를 Excel로 저장"""
+        if self._bloomberg_df is None or self._bloomberg_df.empty:
+            return
+
+        # raw data 폴더 생성
+        raw_data_dir = self.config.OUTPUT_DIR / "raw data"
+        raw_data_dir.mkdir(parents=True, exist_ok=True)
+
+        filename = f"bloomberg_raw_{ref_date_str.replace('-', '')}.xlsx"
+        filepath = raw_data_dir / filename
+
+        try:
+            self._bloomberg_df.to_excel(filepath, index=False, sheet_name='Bloomberg_Data')
+            print(f"  Bloomberg 원본 저장: {filepath}")
+        except Exception as e:
+            print(f"  Bloomberg 원본 저장 실패: {e}")
 
     # =========================================================================
     # Step 4: 데이터 병합 및 최종 결과 생성
@@ -584,6 +605,110 @@ class IPOMonitor:
             col_letter = get_column_letter(col_idx)
             ws.column_dimensions[col_letter].width = excel_width
 
+    def _load_rsi_history_from_excel(self) -> pd.DataFrame:
+        """이전 엑셀 파일에서 RSI 히스토리 로드"""
+        import glob
+
+        pattern = str(self.config.OUTPUT_DIR / "ipo_monitoring_*.xlsx")
+        files = glob.glob(pattern)
+
+        if not files:
+            return pd.DataFrame(columns=['날짜', '분석종목수', 'RSI65이상', '과매수비율(%)', '전일대비'])
+
+        latest_file = max(files)
+
+        try:
+            df = pd.read_excel(latest_file, sheet_name='RSI추이')
+            df['날짜'] = pd.to_datetime(df['날짜'])
+            return df
+        except (ValueError, KeyError):
+            return pd.DataFrame(columns=['날짜', '분석종목수', 'RSI65이상', '과매수비율(%)', '전일대비'])
+
+    def _calculate_rsi_history(self) -> pd.DataFrame:
+        """RSI 65 이상 종목수 히스토리 (평소: 당일만, 초기: 30일 채움)"""
+        from xbbg import blp
+
+        if self._ipo_df is None:
+            return pd.DataFrame(columns=['날짜', '분석종목수', 'RSI65이상', '과매수비율(%)', '전일대비'])
+
+        tickers = self._ipo_df['ticker_ks'].tolist()
+        end_date = self._ref_date if self._ref_date else datetime.now()
+        end_str = end_date.strftime('%Y-%m-%d')
+
+        # 1. 기존 히스토리 로드
+        existing = self._load_rsi_history_from_excel()
+
+        # 2. 초기 실행 여부 확인 (기존 데이터가 5개 미만이면 초기로 간주)
+        is_initial = len(existing) < 5
+
+        if is_initial:
+            # 초기: 30일 히스토리 채우기
+            print(f"\nRSI 히스토리 초기화 ({self.config.RSI_CALC_DAYS}일 계산)...")
+            start_date = end_date - pd.Timedelta(days=45)
+            start_str = start_date.strftime('%Y-%m-%d')
+        else:
+            # 평소: 당일만 계산
+            print(f"\nRSI 히스토리 업데이트 (당일)...")
+            start_str = end_str
+
+        try:
+            rsi_data = blp.bdh(tickers, 'RSI_14D', start_str, end_str)
+
+            if rsi_data.empty:
+                print("  RSI 데이터 없음")
+                return existing if not existing.empty else pd.DataFrame(columns=['날짜', '분석종목수', 'RSI65이상', '과매수비율(%)', '전일대비'])
+
+            # 멀티인덱스 처리
+            if rsi_data.columns.nlevels > 1:
+                rsi_data.columns = rsi_data.columns.droplevel(1)
+
+            # 각 날짜별 RSI 65 이상 종목수 계산
+            calc_results = []
+            for date in rsi_data.index:
+                row_data = rsi_data.loc[date]
+                valid_count = row_data.notna().sum()  # RSI 데이터가 있는 종목 수
+                overbought_count = (row_data >= self.config.RSI_THRESHOLD).sum()
+                ratio = (overbought_count / valid_count * 100) if valid_count > 0 else 0
+                calc_results.append({
+                    '날짜': pd.to_datetime(date),
+                    '분석종목수': int(valid_count),
+                    'RSI65이상': int(overbought_count),
+                    '과매수비율(%)': round(ratio, 1)
+                })
+
+            calculated = pd.DataFrame(calc_results)
+
+            if is_initial:
+                # 초기: 30일만 유지
+                calculated = calculated.tail(self.config.RSI_CALC_DAYS)
+                print(f"  초기 {len(calculated)}일 계산 완료")
+                history = calculated
+            else:
+                # 평소: 기존 + 당일 병합
+                print(f"  당일 데이터 추가")
+                # 당일 날짜가 이미 있으면 제거
+                today_str = end_str
+                existing = existing[existing['날짜'].dt.strftime('%Y-%m-%d') != today_str]
+                history = pd.concat([existing, calculated], ignore_index=True)
+
+            # 날짜순 정렬
+            history = history.sort_values('날짜').reset_index(drop=True)
+
+            # 90일 롤링 유지
+            cutoff_date = end_date - pd.Timedelta(days=self.config.RSI_HISTORY_DAYS)
+            history = history[history['날짜'] >= cutoff_date]
+
+            # 전일대비 계산
+            history['전일대비'] = history['RSI65이상'].diff().fillna(0).astype(int)
+
+            print(f"  RSI 히스토리 총 {len(history)}일")
+
+            return history
+
+        except Exception as e:
+            print(f"  RSI 히스토리 계산 오류: {e}")
+            return existing if not existing.empty else pd.DataFrame(columns=['날짜', '분석종목수', 'RSI65이상', '과매수비율(%)', '전일대비'])
+
     def save_results(self, filename: str = None) -> Path:
         """결과를 Excel로 저장"""
         print("\n" + "=" * 60)
@@ -652,6 +777,15 @@ class IPOMonitor:
                 if not vol_top.empty:
                     vol_top.to_excel(writer, sheet_name='RVOL_TOP', index=False)
                     sheet_names.append('RVOL_TOP')
+
+            # RSI 히스토리 (RSI 65 이상 종목수 일별 추이, 30일)
+            rsi_history = self._calculate_rsi_history()
+            if not rsi_history.empty:
+                rsi_display = rsi_history.copy()
+                rsi_display['날짜'] = rsi_display['날짜'].dt.strftime('%Y-%m-%d')
+                rsi_display = rsi_display.sort_values('날짜', ascending=False)
+                rsi_display.to_excel(writer, sheet_name='RSI추이', index=False)
+                sheet_names.append('RSI추이')
 
             # 컬럼 폭 적용
             for sheet in sheet_names:

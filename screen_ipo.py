@@ -221,7 +221,6 @@ class IPOMonitor:
             'VOLUME_AVG_20D',
             'VOLATILITY_30D',
             'RSI_14D',
-            'CHG_PCT_20D',
             'MOV_AVG_10D',
         ]
 
@@ -280,33 +279,34 @@ class IPOMonitor:
 
         df_hist = pd.concat(results)
 
-        # 디버깅: BDH 결과 확인
-        print(f"\n[DEBUG] BDH 결과:")
-        print(f"  - Shape: {df_hist.shape}")
-        print(f"  - Columns: {list(df_hist.columns)}")
-        print(f"  - Index 샘플: {list(df_hist.index[:3])}")
-
         if bdp_results:
             df_bdp = pd.concat(bdp_results)
-
-            # 디버깅: BDP 결과 확인
-            print(f"\n[DEBUG] BDP 결과:")
-            print(f"  - Shape: {df_bdp.shape}")
-            print(f"  - Columns: {list(df_bdp.columns)}")
-            print(f"  - Index 샘플: {list(df_bdp.index[:3])}")
-
-            # 인덱스 매칭 확인
-            common = set(df_hist.index) & set(df_bdp.index)
-            print(f"  - 공통 인덱스 수: {len(common)}")
-
             df = df_hist.join(df_bdp, how='left')
-
-            # 병합 후 확인
-            print(f"\n[DEBUG] 병합 후:")
-            print(f"  - Columns: {list(df.columns)}")
         else:
-            print("\n[DEBUG] BDP 결과 없음!")
+            print("  ⚠️ BDP 데이터 없음")
             df = df_hist
+
+        # 20일 수익률 BDH로 직접 계산
+        print_progress_bar(1, 1, prefix='20일수익률 계산')
+        try:
+            # 30 calendar days → 영업일 20일 확보
+            start_20d = (ref_date - pd.Timedelta(days=32)).strftime('%Y-%m-%d')
+            price_hist = blp.bdh(tickers, 'PX_LAST', start_20d, ref_date_str)
+
+            if not price_hist.empty and price_hist.columns.nlevels > 1:
+                # 컬럼: MultiIndex(ticker, 'PX_LAST') → ticker만
+                price_hist.columns = price_hist.columns.droplevel(1)
+
+            if not price_hist.empty and len(price_hist) >= 2:
+                # 20영업일 전 가격 (최소 인덱스 기준 앞에서 첫 번째)
+                available_days = len(price_hist)
+                lookback = min(20, available_days - 1)
+                price_now = price_hist.iloc[-1]       # 당일 가격
+                price_20d = price_hist.iloc[-1 - lookback]  # 20영업일 전 가격
+                chg_20d = ((price_now - price_20d) / price_20d * 100).round(2)
+                df['chg_pct_20d'] = chg_20d.reindex(df.index)
+        except Exception as e:
+            print(f"\n  ⚠️ 20일수익률 계산 오류: {e}")
 
         # KS로 안 되는 종목은 KQ로 재시도
         missing = [t for t in tickers if t not in df.index]
@@ -377,22 +377,30 @@ class IPOMonitor:
                 print("    전일 RSI 데이터 없음")
                 return df
 
-            # 멀티인덱스 처리
+            # 멀티인덱스 처리 (BDH: index=날짜, columns=MultiIndex(ticker, field))
             if prev_rsi.columns.nlevels > 1:
-                prev_rsi_flat = prev_rsi.iloc[0].unstack(level=0)
-                if isinstance(prev_rsi_flat, pd.DataFrame):
-                    prev_rsi_series = prev_rsi_flat.iloc[:, 0]
+                # (ticker, field) → tickers를 행으로, field를 열로
+                prev_rsi_flat = prev_rsi.iloc[0].unstack(level=0).T
+                # RSI_14D 열 추출 후 숫자 변환
+                col = [c for c in prev_rsi_flat.columns if 'RSI' in str(c).upper()]
+                if col:
+                    prev_rsi_series = pd.to_numeric(prev_rsi_flat[col[0]], errors='coerce')
                 else:
-                    prev_rsi_series = prev_rsi_flat
+                    prev_rsi_series = pd.to_numeric(prev_rsi_flat.iloc[:, 0], errors='coerce')
             else:
-                prev_rsi_series = prev_rsi.iloc[0]
+                prev_rsi_series = pd.to_numeric(prev_rsi.iloc[0], errors='coerce')
 
             # 전일 RSI 컬럼 추가
-            df['rsi_prev'] = df.index.map(lambda x: prev_rsi_series.get(x, None))
+            df['rsi_prev'] = pd.to_numeric(
+                df.index.map(lambda x: prev_rsi_series.get(x, None)), errors='coerce'
+            )
 
             # RSI 변화량 계산 (당일 RSI - 전일 RSI)
             if 'rsi_14d' in df.columns:
-                df['rsi_change'] = (df['rsi_14d'] - df['rsi_prev']).round(1)
+                df['rsi_change'] = (
+                    pd.to_numeric(df['rsi_14d'], errors='coerce') -
+                    pd.to_numeric(df['rsi_prev'], errors='coerce')
+                ).round(1)
 
             print(f"    전일 RSI 수집 완료")
 
@@ -642,6 +650,203 @@ class IPOMonitor:
     # =========================================================================
     # Step 6: 결과 저장 및 출력
     # =========================================================================
+    def _create_report_sheet(self, writer, df: pd.DataFrame):
+        """POST IPO 보고서 시트 생성 (서식 + 파이차트)"""
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.chart import PieChart, Reference
+        from openpyxl.chart.series import DataPoint
+        from openpyxl.utils import get_column_letter
+
+        wb = writer.book
+        ws = wb.create_sheet('POST IPO 보고서', 0)  # 첫 번째 탭
+
+        # ── 색상 정의 ──────────────────────────────────────────
+        COLOR_NAVY   = '1F3864'
+        COLOR_BLUE   = '2E75B6'
+        COLOR_LIGHT  = 'D6E4F0'
+        COLOR_WHITE  = 'FFFFFF'
+        COLOR_GOLD   = 'C9A84C'
+        COLOR_GREEN  = '70AD47'
+        COLOR_ORANGE = 'ED7D31'
+        COLOR_RED    = 'FF0000'
+        COLOR_GRAY   = 'F2F2F2'
+
+        def fill(color): return PatternFill('solid', fgColor=color)
+        def font(bold=False, color='000000', size=11):
+            return Font(bold=bold, color=color, size=size, name='맑은 고딕')
+        def center(): return Alignment(horizontal='center', vertical='center')
+        def thin_border():
+            s = Side(style='thin', color='BFBFBF')
+            return Border(left=s, right=s, top=s, bottom=s)
+
+        ref_date_str = self._ref_date.strftime('%Y-%m-%d') if self._ref_date else datetime.now().strftime('%Y-%m-%d')
+        total = len(df)
+
+        # ── 등급 분포 계산 ──────────────────────────────────────
+        grade_counts = {'A': 0, 'B': 0, 'C': 0, 'D': 0, 'F': 0}
+        if '등급' in df.columns:
+            for g, cnt in df['등급'].value_counts().items():
+                if g in grade_counts:
+                    grade_counts[g] = int(cnt)
+
+        # 모멘텀 구분: 강세(A+B), 중립(C), 약세(D+F)
+        strong  = grade_counts['A'] + grade_counts['B']
+        neutral = grade_counts['C']
+        weak    = grade_counts['D'] + grade_counts['F']
+
+        # ── 컬럼 너비 설정 ─────────────────────────────────────
+        col_widths = {1: 3, 2: 18, 3: 14, 4: 10, 5: 10, 6: 10, 7: 10, 8: 12, 9: 12, 10: 3}
+        for col, w in col_widths.items():
+            ws.column_dimensions[get_column_letter(col)].width = w
+
+        # ── 타이틀 영역 ────────────────────────────────────────
+        ws.row_dimensions[1].height = 8
+        ws.row_dimensions[2].height = 38
+        ws.row_dimensions[3].height = 20
+        ws.row_dimensions[4].height = 12
+
+        ws.merge_cells('B2:I2')
+        title_cell = ws['B2']
+        title_cell.value = 'POST IPO 모니터링 보고서'
+        title_cell.font = Font(bold=True, color=COLOR_WHITE, size=18, name='맑은 고딕')
+        title_cell.fill = fill(COLOR_NAVY)
+        title_cell.alignment = center()
+
+        ws.merge_cells('B3:I3')
+        sub_cell = ws['B3']
+        sub_cell.value = f'기준일: {ref_date_str}  |  분석 대상: {total}개 종목  |  2년 이내 신규 상장주'
+        sub_cell.font = Font(color=COLOR_WHITE, size=10, name='맑은 고딕')
+        sub_cell.fill = fill(COLOR_BLUE)
+        sub_cell.alignment = center()
+
+        # ── 핵심 지표 카드 (행 5~8) ────────────────────────────
+        ws.row_dimensions[5].height = 10
+        ws.row_dimensions[6].height = 28
+        ws.row_dimensions[7].height = 22
+        ws.row_dimensions[8].height = 12
+
+        cards = [
+            ('전체 종목', str(total), COLOR_BLUE),
+            ('A등급', str(grade_counts['A']), COLOR_GOLD),
+            ('B등급', str(grade_counts['B']), COLOR_GREEN),
+            ('모멘텀 강세\n(A+B등급)', str(strong), COLOR_NAVY),
+        ]
+        card_cols = [2, 4, 6, 8]
+        for (label, value, color), col in zip(cards, card_cols):
+            # 병합 먼저 실행
+            ws.merge_cells(start_row=6, start_column=col, end_row=6, end_column=col + 1)
+            ws.merge_cells(start_row=7, start_column=col, end_row=7, end_column=col + 1)
+
+            # 라벨 셀
+            lc = ws.cell(row=6, column=col)
+            lc.value = label
+            lc.font = Font(bold=True, color=COLOR_WHITE, size=9, name='맑은 고딕')
+            lc.fill = fill(color)
+            lc.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+
+            # 값 셀
+            vc = ws.cell(row=7, column=col)
+            vc.value = int(value)
+            vc.font = Font(bold=True, color=color, size=20, name='맑은 고딕')
+            vc.fill = fill(COLOR_GRAY)
+            vc.alignment = center()
+
+        # ── 섹션: 추천종목 TOP 10 (행 10~) ────────────────────
+        ws.row_dimensions[9].height = 10
+        ws.row_dimensions[10].height = 22
+
+        ws.merge_cells('B10:I10')
+        sec1 = ws['B10']
+        sec1.value = '▶  추천종목 TOP 10  (종합스코어 기준)'
+        sec1.font = Font(bold=True, color=COLOR_WHITE, size=11, name='맑은 고딕')
+        sec1.fill = fill(COLOR_BLUE)
+        sec1.alignment = Alignment(horizontal='left', vertical='center', indent=1)
+
+        headers = ['순위', '종목명', '종합점수', '모멘텀', '수급', '거래량', 'RSI', '등급']
+        header_cols = list(range(2, 10))
+        ws.row_dimensions[11].height = 18
+        for h, c in zip(headers, header_cols):
+            cell = ws.cell(row=11, column=c)
+            cell.value = h
+            cell.font = Font(bold=True, color=COLOR_WHITE, size=9, name='맑은 고딕')
+            cell.fill = fill(COLOR_NAVY)
+            cell.alignment = center()
+            cell.border = thin_border()
+
+        # 추천종목 데이터
+        recommend = self._create_recommendation(df)
+        grade_colors = {'A': 'FFD700', 'B': COLOR_GREEN, 'C': 'FFC000', 'D': 'ED7D31', 'F': 'FF6B6B'}
+
+        if recommend is not None and not recommend.empty:
+            for idx, (_, row) in enumerate(recommend.head(10).iterrows()):
+                r = 12 + idx
+                ws.row_dimensions[r].height = 17
+                row_fill = fill(COLOR_WHITE) if idx % 2 == 0 else fill(COLOR_GRAY)
+                grade_val = df.loc[df['코드명'] == row.get('코드명', ''), '등급'].values
+                grade_str = grade_val[0] if len(grade_val) > 0 else '-'
+
+                data = [
+                    idx + 1,
+                    row.get('코드명', ''),
+                    row.get('종합스코어', ''),
+                    row.get('모멘텀스코어', ''),
+                    row.get('수급스코어', ''),
+                    row.get('거래량스코어', ''),
+                    row.get('RSI(14)', ''),
+                    grade_str,
+                ]
+                for val, c in zip(data, header_cols):
+                    cell = ws.cell(row=r, column=c)
+                    cell.value = val if not (isinstance(val, float) and pd.isna(val)) else '-'
+                    cell.font = font(size=9)
+                    cell.fill = row_fill
+                    cell.alignment = center()
+                    cell.border = thin_border()
+
+                # 등급 셀 색상
+                grade_cell = ws.cell(row=r, column=9)
+                g_color = grade_colors.get(grade_str, 'BFBFBF')
+                grade_cell.fill = fill(g_color)
+                grade_cell.font = Font(bold=True, color=COLOR_WHITE, size=9, name='맑은 고딕')
+
+        # ── 파이차트 데이터 (숨겨진 영역에 기록) ──────────────
+        chart_data_row = 30
+        ws.cell(row=chart_data_row,     column=2).value = '구분'
+        ws.cell(row=chart_data_row,     column=3).value = '종목수'
+        ws.cell(row=chart_data_row + 1, column=2).value = f'강세 (A+B등급)'
+        ws.cell(row=chart_data_row + 1, column=3).value = strong
+        ws.cell(row=chart_data_row + 2, column=2).value = f'중립 (C등급)'
+        ws.cell(row=chart_data_row + 2, column=3).value = neutral
+        ws.cell(row=chart_data_row + 3, column=2).value = f'약세 (D+F등급)'
+        ws.cell(row=chart_data_row + 3, column=3).value = weak
+
+        # 차트 생성
+        pie = PieChart()
+        pie.title = 'Post IPO 모멘텀 현황'
+        pie.style = 10
+
+        data_ref  = Reference(ws, min_col=3, min_row=chart_data_row, max_row=chart_data_row + 3)
+        label_ref = Reference(ws, min_col=2, min_row=chart_data_row + 1, max_row=chart_data_row + 3)
+        pie.add_data(data_ref, titles_from_data=True)
+        pie.set_categories(label_ref)
+
+        # 조각 색상 (강세=파랑, 중립=주황, 약세=빨강)
+        slice_colors = [COLOR_BLUE, COLOR_ORANGE, 'C00000']
+        for i, color in enumerate(slice_colors):
+            pt = DataPoint(idx=i)
+            pt.graphicalProperties.solidFill = color
+            pie.series[0].dPt.append(pt)
+
+        from openpyxl.chart.label import DataLabelList
+        pie.dataLabels = DataLabelList()
+        pie.dataLabels.showPercent = True
+        pie.dataLabels.showCatName = True
+        pie.dataLabels.showVal = False
+
+        pie.width  = 13
+        pie.height = 10
+        ws.add_chart(pie, 'E10')
+
     def _set_column_width(self, writer, sheet_name: str):
         """Excel 시트의 모든 컬럼 폭을 설정"""
         from openpyxl.utils import get_column_letter
@@ -835,6 +1040,9 @@ class IPOMonitor:
                 rsi_display.to_excel(writer, sheet_name='RSI추이', index=False)
                 sheet_names.append('RSI추이')
 
+            # POST IPO 보고서 시트 (첫 번째 탭으로 추가)
+            self._create_report_sheet(writer, df)
+
             # 컬럼 폭 적용
             for sheet in sheet_names:
                 self._set_column_width(writer, sheet)
@@ -870,13 +1078,13 @@ class IPOMonitor:
         if recommend is not None and not recommend.empty:
             print(f"\n[★ 추천종목 TOP {min(n, len(recommend))}] (종합스코어 기준)")
             print("-" * 80)
-            print(f"  {'순위':>4} {'등급':>4} {'종목명':<12} {'종합':>6} {'모멘텀':>6} {'수급':>6} {'거래량':>6}")
+            print(f"  {'순위':>4} {'종목명':<12} {'종합':>6} {'모멘텀':>6} {'수급':>6} {'거래량':>6} {'RSI':>6} {'RSI변화':>7}")
             print("-" * 80)
-            for _, row in recommend.head(n).iterrows():
-                grade = row.get('등급', '-')
-                print(f"  {int(row['순위']):>4} {grade:>4} {row['코드명']:<12} "
+            for i, (_, row) in enumerate(recommend.head(n).iterrows(), 1):
+                print(f"  {i:>4} {row['코드명']:<12} "
                       f"{row['종합스코어']:>6.1f} {row.get('모멘텀스코어', 0):>6.1f} "
-                      f"{row.get('수급스코어', 0):>6.1f} {row.get('거래량스코어', 0):>6.1f}")
+                      f"{row.get('수급스코어', 0):>6.1f} {row.get('거래량스코어', 0):>6.1f} "
+                      f"{row.get('RSI(14)', 0):>6.1f} {row.get('RSI변화량', 0):>+7.1f}")
 
         # RSI 과매도
         if 'RSI(14)' in df.columns:

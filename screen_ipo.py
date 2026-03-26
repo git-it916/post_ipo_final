@@ -14,13 +14,12 @@ Post IPO Monitor
     python run.py
 """
 import pandas as pd
-import numpy as np
 from datetime import datetime
 from pathlib import Path
 import re
 
 from post_ipo_daily import Config
-from post_ipo_daily.utils import print_progress_bar, get_previous_business_day
+from post_ipo_daily.utils import print_progress_bar, get_previous_business_day, get_today_business_day
 
 
 class IPOMonitor:
@@ -43,14 +42,23 @@ class IPOMonitor:
         self._ref_date = None
 
     # =========================================================================
-    # Step 1: IPO 종목 로드 (2년 이내, 일반 주식만)
+    # Step 1: IPO 종목 로드
     # =========================================================================
-    def load_ipo_universe(self) -> pd.DataFrame:
-        """2년 이내 IPO 종목 로드 (ETF/스팩/리츠 제외)"""
+    def load_ipo_universe(self, source: str = 'A') -> pd.DataFrame:
+        """IPO Universe 로드
+        source='A': 최초상장일.xlsx 기준 (2년 이내 자동 필터)
+        source='B': __post ipo univ.xlsx 기준 (Symbol 열 직접 사용)
+        """
         print("\n" + "=" * 60)
         print("[Step 1] IPO Universe 로드")
         print("=" * 60)
 
+        if source == 'B':
+            return self._load_ipo_universe_b()
+        return self._load_ipo_universe_a()
+
+    def _load_ipo_universe_a(self) -> pd.DataFrame:
+        """버전 A: 최초상장일.xlsx — 2년 이내 상장종목 자동 필터"""
         df = pd.read_excel(self.config.IPO_FILE, skiprows=5)
         df.columns = ['코드', '코드명', '최초상장일', '상장일']
 
@@ -85,8 +93,8 @@ class IPOMonitor:
 
         stocks = regular[regular['코드명'].apply(is_regular_stock)].copy()
 
-        # 정리
         stocks = stocks[['코드', '코드명', '최초상장일', '최초상장일_dt']].copy()
+        stocks = stocks.drop_duplicates(subset=['코드'], keep='first')
         stocks['days_since_ipo'] = (datetime.now() - stocks['최초상장일_dt']).dt.days
         stocks['ticker_ks'] = stocks['코드'].str[1:] + ' KS Equity'
         stocks['ticker_kq'] = stocks['코드'].str[1:] + ' KQ Equity'
@@ -94,10 +102,40 @@ class IPOMonitor:
         stocks = stocks.reset_index(drop=True)
 
         self._ipo_df = stocks
-
-        print(f"기준일: {cutoff.strftime('%Y-%m-%d')} 이후 상장")
+        print(f"[버전 A] 기준일: {cutoff.strftime('%Y-%m-%d')} 이후 상장")
         print(f"대상 종목: {len(stocks)}개")
+        return stocks
 
+    def _load_ipo_universe_b(self) -> pd.DataFrame:
+        """버전 B: __post ipo univ.xlsx — Symbol 열의 종목 직접 사용"""
+        df = pd.read_excel(self.config.UNIV_FILE, header=1)
+
+        # Symbol, Name 컬럼 확인
+        if 'Symbol' not in df.columns:
+            print("오류: __post ipo univ.xlsx에 'Symbol' 컬럼이 없습니다.")
+            return pd.DataFrame()
+
+        df = df[['Symbol', 'Name']].copy()
+        df.columns = ['코드', '코드명']
+        df = df.dropna(subset=['코드'])
+
+        # A+6자리 숫자만 (표준 종목코드)
+        def is_regular_code(code):
+            return bool(re.match(r'^A\d{6}$', str(code)))
+
+        stocks = df[df['코드'].apply(is_regular_code)].copy()
+
+        # 상장일 정보 없음 → NaT/NaN 처리
+        stocks['최초상장일'] = None
+        stocks['최초상장일_dt'] = pd.NaT
+        stocks['days_since_ipo'] = None
+        stocks['ticker_ks'] = stocks['코드'].str[1:] + ' KS Equity'
+        stocks['ticker_kq'] = stocks['코드'].str[1:] + ' KQ Equity'
+        stocks = stocks.reset_index(drop=True)
+
+        self._ipo_df = stocks
+        print(f"[버전 B] __post ipo univ.xlsx 로드")
+        print(f"대상 종목: {len(stocks)}개")
         return stocks
 
     # =========================================================================
@@ -170,6 +208,9 @@ class IPOMonitor:
 
         supply_df = pd.DataFrame(supply_records)
 
+        # 중복 코드 제거 (수급.xlsx에 동일 종목 중복 시)
+        supply_df = supply_df.drop_duplicates(subset=['코드'], keep='first')
+
         # 숫자 컬럼 변환
         numeric_cols = ['기관_일간', '기관_5일', '기관_20일', '외국인_일간', '외국인_5일', '외국인_20일']
         for col in numeric_cols:
@@ -183,45 +224,49 @@ class IPOMonitor:
         return supply_df
 
     # =========================================================================
-    # Step 3: Bloomberg 데이터 수집 (전일 T-1 기준)
+    # Step 3: Bloomberg 데이터 수집 (당일 장 마감 기준)
     # =========================================================================
     def fetch_bloomberg_data(self) -> pd.DataFrame:
-        """Bloomberg에서 전일(T-1) 가격, 거래량, RSI, 변동성 수집"""
+        """Bloomberg에서 당일(T-0) 가격, 거래량, RSI, 변동성 수집 (장 마감 후 실행)"""
         from xbbg import blp
 
         print("\n" + "=" * 60)
-        print("[Step 3] Bloomberg 데이터 수집 (T-1)")
+        print("[Step 3] Bloomberg 데이터 수집 (당일 장 마감 기준)")
         print("=" * 60)
 
         if self._ipo_df is None:
             print("오류: IPO Universe를 먼저 로드하세요.")
             return pd.DataFrame()
 
-        # 전일 기준
-        ref_date = get_previous_business_day(self.config)
+        # 당일 기준 (장 마감 후 실행 전제)
+        ref_date = get_today_business_day(self.config)
         ref_date_str = ref_date.strftime('%Y-%m-%d')
         self._ref_date = ref_date
 
-        print(f"기준일: {ref_date_str} (T-1)")
+        print(f"기준일: {ref_date_str} (당일 종가)")
 
-        # 수급 데이터 날짜 검증
+        # 수급 데이터 날짜 검증 (수급은 T-1 기준으로 사용)
+        expected_supply_date = get_previous_business_day(self.config)
+        expected_supply_str = expected_supply_date.strftime('%Y-%m-%d')
         if self._supply_date is not None:
             supply_date_str = self._supply_date.strftime('%Y-%m-%d')
-            if supply_date_str != ref_date_str:
-                print(f"  ⚠️  수급 데이터 날짜({supply_date_str})와 기준일 불일치!")
-                print(f"      수급.xlsx 파일을 최신으로 업데이트하세요.")
+            if supply_date_str != expected_supply_str:
+                print(f"  ⚠️  수급 데이터 날짜({supply_date_str})가 전일({expected_supply_str})과 불일치!")
+                print(f"      수급.xlsx 파일을 전일 기준으로 업데이트하세요.")
+            else:
+                print(f"  수급 기준일: {supply_date_str} (T-1)  |  주가 기준일: {ref_date_str} (T-0)")
 
         tickers = self._ipo_df['ticker_ks'].tolist()
 
-        # BDH용 필드 (히스토리컬)
-        bdh_fields = ['PX_LAST', 'PX_VOLUME', 'CHG_PCT_1D']
+        # BDH용 필드 (히스토리컬) — RSI_14D를 BDH로 수집하여 당일자 확보
+        bdh_fields = ['PX_LAST', 'PX_VOLUME', 'CHG_PCT_1D', 'RSI_14D']
 
         # BDP용 필드 (기술적 지표)
         bdp_fields = [
             'VOLUME_AVG_20D',
             'VOLATILITY_30D',
-            'RSI_14D',
             'MOV_AVG_10D',
+            'CUR_MKT_CAP',   # 시가총액 (백만원 단위)
         ]
 
         print(f"대상: {len(tickers)}개 종목\n")
@@ -457,10 +502,14 @@ class IPOMonitor:
 
             bbg_cols = ['코드', 'px_last', 'px_volume', 'volume_avg_20d', 'rvol_20',
                         'volatility_30d', 'rsi_14d', 'rsi_prev', 'rsi_change',
-                        'chg_pct_1d', 'chg_pct_20d', 'mov_avg_10d', 'above_ma10']
+                        'chg_pct_1d', 'chg_pct_20d', 'mov_avg_10d', 'above_ma10',
+                        'cur_mkt_cap']
             bbg_cols = [c for c in bbg_cols if c in bbg.columns]
 
             result = result.merge(bbg[bbg_cols], on='코드', how='left')
+
+        # 중복 행 제거 (merge 후 혹시 남은 중복)
+        result = result.drop_duplicates(subset=['코드'], keep='first')
 
         # 컬럼명 정리
         rename_map = {
@@ -475,9 +524,20 @@ class IPOMonitor:
             'chg_pct_1d': '1일수익률(%)',
             'chg_pct_20d': '20일수익률(%)',
             'mov_avg_10d': '10일이평',
-            'above_ma10': '10일선돌파'
+            'above_ma10': '10일선돌파',
+            'cur_mkt_cap': '시가총액(억)',
         }
         result = result.rename(columns=rename_map)
+
+        # 시가총액 단위 변환 및 1000억 미만 제외
+        # Bloomberg CUR_MKT_CAP: 백만원 단위 → 억원 = /100
+        if '시가총액(억)' in result.columns:
+            result['시가총액(억)'] = (
+                pd.to_numeric(result['시가총액(억)'], errors='coerce') / 100
+            ).round(0)
+            before = len(result)
+            result = result[result['시가총액(억)'].fillna(0) >= 1000].copy()
+            print(f"  시가총액 1000억 미만 제외: {before - len(result)}개 종목 제거 → {len(result)}개 유지")
 
         # 상장일 형식 변경
         if '상장일' in result.columns:
@@ -531,28 +591,34 @@ class IPOMonitor:
         """
         result = df.copy()
 
-        # ===== 1. 모멘텀 스코어 =====
-        momentum_components = []
+        # ===== 1. 모멘텀 스코어 (1일수익률 30% + 20일수익률 30% + 10일선돌파 20% + RSI 20%) =====
+        momentum_parts = []
+        momentum_weights = []
+
+        if '1일수익률(%)' in result.columns:
+            result['_m1'] = self._normalize_score(result['1일수익률(%)'], higher_is_better=True)
+            momentum_parts.append('_m1')
+            momentum_weights.append(0.3)
 
         if '20일수익률(%)' in result.columns:
-            result['_m1'] = self._normalize_score(result['20일수익률(%)'], higher_is_better=True)
-            momentum_components.append('_m1')
+            result['_m2'] = self._normalize_score(result['20일수익률(%)'], higher_is_better=True)
+            momentum_parts.append('_m2')
+            momentum_weights.append(0.3)
 
         if '10일선돌파' in result.columns:
-            result['_m2'] = result['10일선돌파'].fillna(0) * 100
-            momentum_components.append('_m2')
+            result['_m3'] = result['10일선돌파'].fillna(0) * 100
+            momentum_parts.append('_m3')
+            momentum_weights.append(0.2)
 
         if 'RSI(14)' in result.columns:
-            rsi = result['RSI(14)'].fillna(50)
-            result['_m3'] = np.where(
-                rsi < 30, 20,
-                np.where(rsi > 70, 30,
-                         np.where(rsi >= 50, 80, 60))
-            )
-            momentum_components.append('_m3')
+            result['_m4'] = self._normalize_score(result['RSI(14)'], higher_is_better=True)
+            momentum_parts.append('_m4')
+            momentum_weights.append(0.2)
 
-        if momentum_components:
-            result['모멘텀스코어'] = result[momentum_components].mean(axis=1).round(1)
+        if momentum_parts:
+            weighted = sum(result[c] * w for c, w in zip(momentum_parts, momentum_weights))
+            total_w = sum(momentum_weights)
+            result['모멘텀스코어'] = (weighted / total_w).round(1)
         else:
             result['모멘텀스코어'] = 50
 
@@ -694,8 +760,13 @@ class IPOMonitor:
         neutral = grade_counts['C']
         weak    = grade_counts['D'] + grade_counts['F']
 
+        # 종합스코어 50점 이상 종목 수
+        score_50_plus = int(
+            (pd.to_numeric(df.get('종합스코어', pd.Series(dtype=float)), errors='coerce') >= 50).sum()
+        )
+
         # ── 컬럼 너비 설정 ─────────────────────────────────────
-        col_widths = {1: 3, 2: 18, 3: 14, 4: 10, 5: 10, 6: 10, 7: 10, 8: 12, 9: 12, 10: 3}
+        col_widths = {1: 3, 2: 18, 3: 14, 4: 10, 5: 10, 6: 10, 7: 10, 8: 12, 9: 12, 10: 10, 11: 14, 12: 3, 13: 16, 14: 10}
         for col, w in col_widths.items():
             ws.column_dimensions[get_column_letter(col)].width = w
 
@@ -729,7 +800,7 @@ class IPOMonitor:
             ('전체 종목', str(total), COLOR_BLUE),
             ('A등급', str(grade_counts['A']), COLOR_GOLD),
             ('B등급', str(grade_counts['B']), COLOR_GREEN),
-            ('모멘텀 강세\n(A+B등급)', str(strong), COLOR_NAVY),
+            ('50점 이상\n종목수', str(score_50_plus), COLOR_NAVY),
         ]
         card_cols = [2, 4, 6, 8]
         for (label, value, color), col in zip(cards, card_cols):
@@ -755,15 +826,15 @@ class IPOMonitor:
         ws.row_dimensions[9].height = 10
         ws.row_dimensions[10].height = 22
 
-        ws.merge_cells('B10:I10')
+        ws.merge_cells('B10:J10')
         sec1 = ws['B10']
-        sec1.value = '▶  추천종목 TOP 10  (종합스코어 기준)'
+        sec1.value = '▶  추천종목  (종합스코어 50점 이상)'
         sec1.font = Font(bold=True, color=COLOR_WHITE, size=11, name='맑은 고딕')
         sec1.fill = fill(COLOR_BLUE)
         sec1.alignment = Alignment(horizontal='left', vertical='center', indent=1)
 
-        headers = ['순위', '종목명', '종합점수', '모멘텀', '수급', '거래량', 'RSI', '등급']
-        header_cols = list(range(2, 10))
+        headers = ['순위', '종목명', '종합점수', '모멘텀', '수급', '거래량', 'RSI', '등급', 'RSI신호']
+        header_cols = list(range(2, 11))  # B~J (columns 2~10)
         ws.row_dimensions[11].height = 18
         for h, c in zip(headers, header_cols):
             cell = ws.cell(row=11, column=c)
@@ -773,17 +844,30 @@ class IPOMonitor:
             cell.alignment = center()
             cell.border = thin_border()
 
-        # 추천종목 데이터
-        recommend = self._create_recommendation(df)
+        # 추천종목 데이터: 종합스코어 50점 이상 전체 (TOP_N 제한 없이 df에서 직접 필터)
         grade_colors = {'A': 'FFD700', 'B': COLOR_GREEN, 'C': 'FFC000', 'D': 'ED7D31', 'F': 'FF6B6B'}
 
-        if recommend is not None and not recommend.empty:
-            for idx, (_, row) in enumerate(recommend.head(10).iterrows()):
+        if '종합스코어' in df.columns:
+            scored = pd.to_numeric(df['종합스코어'], errors='coerce')
+            filtered_rec = df[scored >= 50].sort_values('종합스코어', ascending=False).reset_index(drop=True)
+        else:
+            filtered_rec = pd.DataFrame()
+
+        if not filtered_rec.empty:
+            for idx, (_, row) in enumerate(filtered_rec.iterrows()):
                 r = 12 + idx
                 ws.row_dimensions[r].height = 17
                 row_fill = fill(COLOR_WHITE) if idx % 2 == 0 else fill(COLOR_GRAY)
-                grade_val = df.loc[df['코드명'] == row.get('코드명', ''), '등급'].values
-                grade_str = grade_val[0] if len(grade_val) > 0 else '-'
+                grade_str = row.get('등급', '-') if pd.notna(row.get('등급', None)) else '-'
+
+                # RSI 65 신규 돌파 신호: 전일 RSI < 65 이고 당일 RSI >= 65
+                rsi_cur  = pd.to_numeric(row.get('RSI(14)', None), errors='coerce')
+                rsi_prev_val = pd.to_numeric(row.get('전일RSI(14)', None), errors='coerce')
+                rsi_signal = (
+                    '★' if (pd.notna(rsi_cur) and pd.notna(rsi_prev_val)
+                            and rsi_cur >= 65 and rsi_prev_val < 65)
+                    else ''
+                )
 
                 data = [
                     idx + 1,
@@ -794,6 +878,7 @@ class IPOMonitor:
                     row.get('거래량스코어', ''),
                     row.get('RSI(14)', ''),
                     grade_str,
+                    rsi_signal,
                 ]
                 for val, c in zip(data, header_cols):
                     cell = ws.cell(row=r, column=c)
@@ -803,30 +888,54 @@ class IPOMonitor:
                     cell.alignment = center()
                     cell.border = thin_border()
 
-                # 등급 셀 색상
+                # 등급 셀 색상 (column 9)
                 grade_cell = ws.cell(row=r, column=9)
                 g_color = grade_colors.get(grade_str, 'BFBFBF')
                 grade_cell.fill = fill(g_color)
                 grade_cell.font = Font(bold=True, color=COLOR_WHITE, size=9, name='맑은 고딕')
 
-        # ── 파이차트 데이터 (숨겨진 영역에 기록) ──────────────
-        chart_data_row = 30
-        ws.cell(row=chart_data_row,     column=2).value = '구분'
-        ws.cell(row=chart_data_row,     column=3).value = '종목수'
-        ws.cell(row=chart_data_row + 1, column=2).value = f'강세 (A+B등급)'
-        ws.cell(row=chart_data_row + 1, column=3).value = strong
-        ws.cell(row=chart_data_row + 2, column=2).value = f'중립 (C등급)'
-        ws.cell(row=chart_data_row + 2, column=3).value = neutral
-        ws.cell(row=chart_data_row + 3, column=2).value = f'약세 (D+F등급)'
-        ws.cell(row=chart_data_row + 3, column=3).value = weak
+                # RSI 신호 셀 색상 (column 10) — 신호 있을 때 강조
+                if rsi_signal:
+                    sig_cell = ws.cell(row=r, column=10)
+                    sig_cell.fill = fill('FFF2CC')  # 연노랑
+                    sig_cell.font = Font(bold=True, color='C9A84C', size=10, name='맑은 고딕')
+
+        # ── K열: RSI>65 라벨 + COUNTIF ──────────────────────────
+        # K10: 라벨, K11: 전체 시트 P열(RSI(14)) 기준 65이상 종목 수
+        k10 = ws.cell(row=10, column=11)
+        k10.value = 'RSI>65'
+        k10.font = Font(bold=True, color=COLOR_WHITE, size=9, name='맑은 고딕')
+        k10.fill = fill(COLOR_NAVY)
+        k10.alignment = center()
+        k10.border = thin_border()
+
+        k11 = ws.cell(row=11, column=11)
+        k11.value = '=COUNTIF(전체!P2:P10000,">=65")'
+        k11.font = Font(bold=True, color=COLOR_NAVY, size=16, name='맑은 고딕')
+        k11.alignment = center()
+        k11.border = thin_border()
+
+        # ── 파이차트 데이터: M10 (column 13) 기준 ───────────────
+        CHART_ROW = 10
+        CHART_COL_LABEL = 13  # M열
+        CHART_COL_VAL   = 14  # N열
+
+        ws.cell(row=CHART_ROW,     column=CHART_COL_LABEL).value = '구분'
+        ws.cell(row=CHART_ROW,     column=CHART_COL_VAL).value   = '종목수'
+        ws.cell(row=CHART_ROW + 1, column=CHART_COL_LABEL).value = '강세 (A+B등급)'
+        ws.cell(row=CHART_ROW + 1, column=CHART_COL_VAL).value   = strong
+        ws.cell(row=CHART_ROW + 2, column=CHART_COL_LABEL).value = '중립 (C등급)'
+        ws.cell(row=CHART_ROW + 2, column=CHART_COL_VAL).value   = neutral
+        ws.cell(row=CHART_ROW + 3, column=CHART_COL_LABEL).value = '약세 (D+F등급)'
+        ws.cell(row=CHART_ROW + 3, column=CHART_COL_VAL).value   = weak
 
         # 차트 생성
         pie = PieChart()
         pie.title = 'Post IPO 모멘텀 현황'
         pie.style = 10
 
-        data_ref  = Reference(ws, min_col=3, min_row=chart_data_row, max_row=chart_data_row + 3)
-        label_ref = Reference(ws, min_col=2, min_row=chart_data_row + 1, max_row=chart_data_row + 3)
+        data_ref  = Reference(ws, min_col=CHART_COL_VAL,   min_row=CHART_ROW,     max_row=CHART_ROW + 3)
+        label_ref = Reference(ws, min_col=CHART_COL_LABEL, min_row=CHART_ROW + 1, max_row=CHART_ROW + 3)
         pie.add_data(data_ref, titles_from_data=True)
         pie.set_categories(label_ref)
 
@@ -845,7 +954,7 @@ class IPOMonitor:
 
         pie.width  = 13
         pie.height = 10
-        ws.add_chart(pie, 'E10')
+        ws.add_chart(pie, 'M14')
 
     def _set_column_width(self, writer, sheet_name: str):
         """Excel 시트의 모든 컬럼 폭을 설정"""
@@ -1065,7 +1174,7 @@ class IPOMonitor:
         print("                    IPO 모니터링 요약")
         print("=" * 80)
         ref_date_str = self._ref_date.strftime('%Y-%m-%d') if self._ref_date else '(미정)'
-        print(f"데이터 기준일: {ref_date_str} (T-1)")
+        print(f"데이터 기준일: {ref_date_str} (당일 종가)")
         print(f"실행일: {datetime.now().strftime('%Y-%m-%d')}")
         print(f"총 종목 수: {len(df)}개")
 
@@ -1127,9 +1236,12 @@ class IPOMonitor:
     # =========================================================================
     # 전체 실행
     # =========================================================================
-    def run(self) -> pd.DataFrame:
-        """전체 모니터링 프로세스 실행"""
-        self.load_ipo_universe()
+    def run(self, source: str = 'A') -> pd.DataFrame:
+        """전체 모니터링 프로세스 실행
+        source='A': 최초상장일.xlsx (기본)
+        source='B': __post ipo univ.xlsx
+        """
+        self.load_ipo_universe(source=source)
         self.load_supply_data()
         self.fetch_bloomberg_data()
         self.merge_data()

@@ -39,6 +39,11 @@ class Config:
         """수급.xlsx 파일 경로"""
         return self.PARENT_DIR / "수급.xlsx"
 
+    @property
+    def UNIV_FILE(self) -> Path:
+        """__post ipo univ.xlsx 파일 경로 (버전 B용)"""
+        return self.BASE_DIR / "__post ipo univ.xlsx"
+
     # RSI 추적 설정
     RSI_THRESHOLD: int = 65  # RSI 기준값
     RSI_HISTORY_DAYS: int = 90  # 보관 기간 (3개월)

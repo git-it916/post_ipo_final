@@ -26,12 +26,26 @@ def get_previous_business_day(config: Config = None) -> datetime:
     today = datetime.now()
     prev_day = today - timedelta(days=1)
 
-    # 주말 또는 공휴일이면 건너뛰기
     while (prev_day.weekday() >= 5 or
            prev_day.strftime('%Y-%m-%d') in config.KR_HOLIDAYS):
         prev_day -= timedelta(days=1)
 
     return prev_day
+
+
+def get_today_business_day(config: Config = None) -> datetime:
+    """당일 영업일 계산 (장 마감 후 실행 기준)
+    - 오늘이 영업일이면 오늘 반환
+    - 오늘이 주말/공휴일이면 직전 영업일 반환
+    """
+    config = config or Config()
+    day = datetime.now()
+
+    while (day.weekday() >= 5 or
+           day.strftime('%Y-%m-%d') in config.KR_HOLIDAYS):
+        day -= timedelta(days=1)
+
+    return day
 
 
 def setup_logging(

@@ -12,11 +12,12 @@ Post IPO Monitor Package
 __version__ = "3.0.0"
 
 from .config import Config
-from .utils import setup_logging, print_progress_bar, get_previous_business_day
+from .utils import setup_logging, print_progress_bar, get_previous_business_day, get_today_business_day
 
 __all__ = [
     "Config",
     "setup_logging",
     "print_progress_bar",
     "get_previous_business_day",
+    "get_today_business_day",
 ]

@@ -193,4 +193,5 @@ python run.py
 | `최초상장일.xlsx` 업데이트 | 신규 상장 발생 시 | 담당자 |
 | 공휴일 정보 추가 | 연 1회 (연초) | 개발 담당 |
 
-python run.py --b
+python run.py        # 버전 A (최초상장일.xlsx 기준)
+python run.py --b    # 버전 B (__post ipo univ.xlsx 기준)

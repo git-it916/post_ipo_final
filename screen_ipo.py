@@ -226,47 +226,71 @@ class IPOMonitor:
     # =========================================================================
     # Step 3: Bloomberg 데이터 수집 (당일 장 마감 기준)
     # =========================================================================
-    def fetch_bloomberg_data(self) -> pd.DataFrame:
-        """Bloomberg에서 당일(T-0) 가격, 거래량, RSI, 변동성 수집 (장 마감 후 실행)"""
+    def fetch_bloomberg_data(self, use_prev_day: bool = False) -> pd.DataFrame:
+        """Bloomberg에서 가격, 거래량, RSI, 변동성 수집
+        use_prev_day=False: 당일(T-0) 종가 기준 (장 마감 직후 실행)
+        use_prev_day=True:  전일(T-1) 종가 기준 (다음날 실행)
+        """
         from xbbg import blp
 
+        mode_label = '전일 종가 기준 (다음날 실행)' if use_prev_day else '당일 장 마감 기준'
         print("\n" + "=" * 60)
-        print("[Step 3] Bloomberg 데이터 수집 (당일 장 마감 기준)")
+        print(f"[Step 3] Bloomberg 데이터 수집 ({mode_label})")
         print("=" * 60)
 
         if self._ipo_df is None:
             print("오류: IPO Universe를 먼저 로드하세요.")
             return pd.DataFrame()
 
-        # 당일 기준 (장 마감 후 실행 전제)
-        ref_date = get_today_business_day(self.config)
+        # 기준일 결정
+        if use_prev_day:
+            ref_date = get_previous_business_day(self.config)
+        else:
+            ref_date = get_today_business_day(self.config)
         ref_date_str = ref_date.strftime('%Y-%m-%d')
         self._ref_date = ref_date
 
-        print(f"기준일: {ref_date_str} (당일 종가)")
+        print(f"기준일: {ref_date_str} ({'전일 종가' if use_prev_day else '당일 종가'})")
 
-        # 수급 데이터 날짜 검증 (수급은 T-1 기준으로 사용)
-        expected_supply_date = get_previous_business_day(self.config)
-        expected_supply_str = expected_supply_date.strftime('%Y-%m-%d')
+        # 수급 데이터 날짜 검증
+        if use_prev_day:
+            # 다음날 실행: 수급 데이터도 ref_date(전일) 기준이어야 함
+            expected_supply_str = ref_date_str
+        else:
+            # 당일 실행: 수급은 T-1 기준
+            expected_supply_date = get_previous_business_day(self.config)
+            expected_supply_str = expected_supply_date.strftime('%Y-%m-%d')
+
         if self._supply_date is not None:
             supply_date_str = self._supply_date.strftime('%Y-%m-%d')
             if supply_date_str != expected_supply_str:
-                print(f"  ⚠️  수급 데이터 날짜({supply_date_str})가 전일({expected_supply_str})과 불일치!")
-                print(f"      수급.xlsx 파일을 전일 기준으로 업데이트하세요.")
+                print(f"  ⚠️  수급 데이터 날짜({supply_date_str})가 기대값({expected_supply_str})과 불일치!")
+                print(f"      수급.xlsx 파일을 확인하세요.")
             else:
-                print(f"  수급 기준일: {supply_date_str} (T-1)  |  주가 기준일: {ref_date_str} (T-0)")
+                print(f"  수급 기준일: {supply_date_str}  |  주가 기준일: {ref_date_str}")
 
         tickers = self._ipo_df['ticker_ks'].tolist()
 
-        # BDH용 필드 (히스토리컬) — RSI_14D를 BDH로 수집하여 당일자 확보
-        bdh_fields = ['PX_LAST', 'PX_VOLUME', 'CHG_PCT_1D', 'RSI_14D']
+        # BDH용 필드 (히스토리컬) — 당일자 기준 수집
+        bdh_fields = [
+            'PX_LAST',        # 종가
+            'PX_VOLUME',      # 거래량
+            'TURNOVER',       # 거래대금 (원)
+            'CHG_PCT_1D',     # 일간 등락률(%)
+            'RSI_14D',        # RSI(14)
+        ]
 
-        # BDP용 필드 (기술적 지표)
+        # BDP용 필드 (스냅샷/기술적 지표)
         bdp_fields = [
-            'VOLUME_AVG_20D',
-            'VOLATILITY_30D',
-            'MOV_AVG_10D',
-            'CUR_MKT_CAP',   # 시가총액 (백만원 단위)
+            'VOLUME_AVG_20D',          # 20일 평균 거래량
+            'VOLATILITY_30D',          # 30일 변동성
+            'MOV_AVG_10D',             # 10일 이동평균
+            'MOV_AVG_20D',             # 20일 이동평균
+            'MOV_AVG_60D',             # 60일 이동평균
+            'BOLLINGER_BAND_WIDTH',    # 볼린저밴드 폭
+            'CUR_MKT_CAP',            # 시가총액 (백만원)
+            'EQY_FREE_FLOAT_PCT',     # 유통비율(%)
+            'SHORT_INT_RATIO',        # 공매도 비율
         ]
 
         print(f"대상: {len(tickers)}개 종목\n")
@@ -386,12 +410,22 @@ class IPOMonitor:
                 df['px_volume'] / df['volume_avg_20d']
             ).round(2)
 
+        # 거래대금 억원 변환
+        if 'turnover' in df.columns:
+            df['turnover'] = (
+                pd.to_numeric(df['turnover'], errors='coerce') / 100_000_000
+            ).round(1)
+
         # 전일 RSI 가져오기
         df = self._fetch_previous_rsi(df, tickers, ref_date)
 
-        # 10일선 돌파 여부
+        # 이동평균선 돌파 여부
         if 'px_last' in df.columns and 'mov_avg_10d' in df.columns:
             df['above_ma10'] = (df['px_last'] > df['mov_avg_10d']).astype(int)
+        if 'px_last' in df.columns and 'mov_avg_20d' in df.columns:
+            df['above_ma20'] = (df['px_last'] > df['mov_avg_20d']).astype(int)
+        if 'px_last' in df.columns and 'mov_avg_60d' in df.columns:
+            df['above_ma60'] = (df['px_last'] > df['mov_avg_60d']).astype(int)
 
         self._bloomberg_df = df.reset_index().rename(columns={'index': 'ticker'})
 
@@ -500,10 +534,13 @@ class IPOMonitor:
             bbg = self._bloomberg_df.copy()
             bbg['코드'] = 'A' + bbg['ticker'].str.split(' ').str[0]
 
-            bbg_cols = ['코드', 'px_last', 'px_volume', 'volume_avg_20d', 'rvol_20',
+            bbg_cols = ['코드', 'px_last', 'px_volume', 'turnover', 'volume_avg_20d', 'rvol_20',
                         'volatility_30d', 'rsi_14d', 'rsi_prev', 'rsi_change',
-                        'chg_pct_1d', 'chg_pct_20d', 'mov_avg_10d', 'above_ma10',
-                        'cur_mkt_cap']
+                        'chg_pct_1d', 'chg_pct_20d',
+                        'mov_avg_10d', 'mov_avg_20d', 'mov_avg_60d',
+                        'above_ma10', 'above_ma20', 'above_ma60',
+                        'bollinger_band_width',
+                        'cur_mkt_cap', 'eqy_free_float_pct', 'short_int_ratio']
             bbg_cols = [c for c in bbg_cols if c in bbg.columns]
 
             result = result.merge(bbg[bbg_cols], on='코드', how='left')
@@ -515,17 +552,25 @@ class IPOMonitor:
         rename_map = {
             'px_last': '현재가',
             'px_volume': '거래량',
+            'turnover': '거래대금(억)',
             'volume_avg_20d': '20일평균거래량',
             'rvol_20': 'RVOL(20)',
             'volatility_30d': '변동성(30D)',
+            'bollinger_band_width': 'BB폭',
             'rsi_14d': 'RSI(14)',
             'rsi_prev': '전일RSI(14)',
             'rsi_change': 'RSI변화량',
             'chg_pct_1d': '1일수익률(%)',
             'chg_pct_20d': '20일수익률(%)',
             'mov_avg_10d': '10일이평',
+            'mov_avg_20d': '20일이평',
+            'mov_avg_60d': '60일이평',
             'above_ma10': '10일선돌파',
+            'above_ma20': '20일선돌파',
+            'above_ma60': '60일선돌파',
             'cur_mkt_cap': '시가총액(억)',
+            'eqy_free_float_pct': '유통비율(%)',
+            'short_int_ratio': '공매도비율',
         }
         result = result.rename(columns=rename_map)
 
@@ -704,10 +749,12 @@ class IPOMonitor:
         top = df.nlargest(self.config.TOP_N_RESULTS, '종합스코어').copy()
 
         display_cols = [
-            '코드', '코드명', '상장일', '현재가',
+            '코드', '코드명', '상장일', '현재가', '거래대금(억)',
             '종합스코어', '모멘텀스코어', '수급스코어', '거래량스코어',
             'RSI변화량', 'RSI(14)', '전일RSI(14)',
-            'RVOL(20)', '기관_일간', '외국인_일간', '10일선돌파', '변동성(30D)'
+            'RVOL(20)', '기관_일간', '외국인_일간',
+            '10일선돌파', '20일선돌파', '60일선돌파',
+            '변동성(30D)', 'BB폭', '유통비율(%)', '공매도비율',
         ]
         display_cols = [c for c in display_cols if c in top.columns]
 
@@ -716,7 +763,7 @@ class IPOMonitor:
     # =========================================================================
     # Step 6: 결과 저장 및 출력
     # =========================================================================
-    def _create_report_sheet(self, writer, df: pd.DataFrame):
+    def _create_report_sheet(self, writer, df: pd.DataFrame, has_prev_data: bool = False):
         """POST IPO 보고서 시트 생성 (서식 + 파이차트)"""
         from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
         from openpyxl.chart import PieChart, Reference
@@ -826,7 +873,7 @@ class IPOMonitor:
         ws.row_dimensions[9].height = 10
         ws.row_dimensions[10].height = 22
 
-        ws.merge_cells('B10:J10')
+        ws.merge_cells('B10:O10')
         sec1 = ws['B10']
         sec1.value = '▶  추천종목  (종합스코어 50점 이상)'
         sec1.font = Font(bold=True, color=COLOR_WHITE, size=11, name='맑은 고딕')
@@ -900,25 +947,120 @@ class IPOMonitor:
                     sig_cell.fill = fill('FFF2CC')  # 연노랑
                     sig_cell.font = Font(bold=True, color='C9A84C', size=10, name='맑은 고딕')
 
-        # ── K열: RSI>65 라벨 + COUNTIF ──────────────────────────
-        # K10: 라벨, K11: 전체 시트 P열(RSI(14)) 기준 65이상 종목 수
-        k10 = ws.cell(row=10, column=11)
-        k10.value = 'RSI>65'
-        k10.font = Font(bold=True, color=COLOR_WHITE, size=9, name='맑은 고딕')
-        k10.fill = fill(COLOR_NAVY)
-        k10.alignment = center()
-        k10.border = thin_border()
+        # ── K·L열: 등급변화 + 점수변화량 (전일 데이터 있을 때) ─────
+        if has_prev_data:
+            # K11 헤더
+            k11 = ws.cell(row=11, column=11)
+            k11.value = '등급변화'
+            k11.font = Font(bold=True, color=COLOR_WHITE, size=9, name='맑은 고딕')
+            k11.fill = fill(COLOR_NAVY)
+            k11.alignment = center()
+            k11.border = thin_border()
 
-        k11 = ws.cell(row=11, column=11)
-        k11.value = '=COUNTIF(전체!P2:P10000,">=65")'
-        k11.font = Font(bold=True, color=COLOR_NAVY, size=16, name='맑은 고딕')
-        k11.alignment = center()
-        k11.border = thin_border()
+            # L11 헤더
+            l11 = ws.cell(row=11, column=12)
+            l11.value = '점수변화량'
+            l11.font = Font(bold=True, color=COLOR_WHITE, size=9, name='맑은 고딕')
+            l11.fill = fill(COLOR_NAVY)
+            l11.alignment = center()
+            l11.border = thin_border()
 
-        # ── 파이차트 데이터: M10 (column 13) 기준 ───────────────
+            # K12+, L12+ 수식 (추천종목 데이터 행)
+            # INDEX/MATCH 사용 — 컬럼 수가 변해도 컬럼명으로 정확히 참조
+            # 전체_전일자 시트: 1행=헤더, B열=코드명
+            rec_count = len(filtered_rec) if not filtered_rec.empty else 0
+            for idx in range(rec_count):
+                r = 12 + idx
+                row_fill = fill(COLOR_WHITE) if idx % 2 == 0 else fill(COLOR_GRAY)
+
+                # 등급변화: INDEX/MATCH로 전일 등급 찾기
+                k_cell = ws.cell(row=r, column=11)
+                prev_grade = (
+                    'INDEX(전체_전일자!1:1048576,'
+                    'MATCH(C{r},전체_전일자!B:B,0),'
+                    'MATCH("등급",전체_전일자!1:1,0))'
+                ).format(r=r)
+                k_cell.value = (
+                    f'=IFERROR(IF(I{r}={prev_grade},'
+                    f'"유지",'
+                    f'{prev_grade}&" → "&I{r}),"")'
+                )
+                k_cell.font = font(size=9)
+                k_cell.fill = row_fill
+                k_cell.alignment = center()
+                k_cell.border = thin_border()
+
+                # 점수변화량: 당일 종합점수 - 전일 종합스코어
+                l_cell = ws.cell(row=r, column=12)
+                prev_score = (
+                    'INDEX(전체_전일자!1:1048576,'
+                    'MATCH(C{r},전체_전일자!B:B,0),'
+                    'MATCH("종합스코어",전체_전일자!1:1,0))'
+                ).format(r=r)
+                l_cell.value = f'=IFERROR(D{r}-{prev_score},"")'
+                l_cell.number_format = '+0.0;-0.0;0.0'
+                l_cell.font = font(size=9)
+                l_cell.fill = row_fill
+                l_cell.alignment = center()
+                l_cell.border = thin_border()
+
+            # M·N·O열: 모멘텀/수급/거래량 변화량
+            for col_idx, label in [(13, '모멘텀Δ'), (14, '수급Δ'), (15, '거래량Δ')]:
+                hdr = ws.cell(row=11, column=col_idx)
+                hdr.value = label
+                hdr.font = Font(bold=True, color=COLOR_WHITE, size=9, name='맑은 고딕')
+                hdr.fill = fill(COLOR_NAVY)
+                hdr.alignment = center()
+                hdr.border = thin_border()
+
+            # M12+, N12+, O12+ 수식 — INDEX/MATCH로 컬럼명 기반 참조
+            score_cols = [
+                (13, 'E', '모멘텀스코어'),
+                (14, 'F', '수급스코어'),
+                (15, 'G', '거래량스코어'),
+            ]
+            for idx in range(rec_count):
+                r = 12 + idx
+                row_fill_val = fill(COLOR_WHITE) if idx % 2 == 0 else fill(COLOR_GRAY)
+                for col_idx, src_col, prev_col_name in score_cols:
+                    prev_val = (
+                        'INDEX(전체_전일자!1:1048576,'
+                        'MATCH(C{r},전체_전일자!B:B,0),'
+                        'MATCH("{col}",전체_전일자!1:1,0))'
+                    ).format(r=r, col=prev_col_name)
+                    cell = ws.cell(row=r, column=col_idx)
+                    cell.value = f'=IFERROR({src_col}{r}-{prev_val},"")'
+                    cell.number_format = '+0.0;-0.0;0.0'
+                    cell.font = font(size=9)
+                    cell.fill = row_fill_val
+                    cell.alignment = center()
+                    cell.border = thin_border()
+
+            # 컬럼 너비
+            ws.column_dimensions['K'].width = 14
+            ws.column_dimensions['L'].width = 16
+            ws.column_dimensions['M'].width = 11
+            ws.column_dimensions['N'].width = 10
+            ws.column_dimensions['O'].width = 11
+
+        # ── J6~J7: RSI>65 라벨 + COUNTIF ──────────────────────────
+        ws.merge_cells(start_row=6, start_column=10, end_row=6, end_column=10)
+        j6 = ws.cell(row=6, column=10)
+        j6.value = 'RSI>65'
+        j6.font = Font(bold=True, color=COLOR_WHITE, size=9, name='맑은 고딕')
+        j6.fill = fill(COLOR_NAVY)
+        j6.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+
+        j7 = ws.cell(row=7, column=10)
+        j7.value = '=COUNTIF(전체!P2:P10000,">=65")'
+        j7.font = Font(bold=True, color=COLOR_NAVY, size=20, name='맑은 고딕')
+        j7.fill = fill(COLOR_GRAY)
+        j7.alignment = center()
+
+        # ── 파이차트 데이터: Q10 (column 17) 기준 ───────────────
         CHART_ROW = 10
-        CHART_COL_LABEL = 13  # M열
-        CHART_COL_VAL   = 14  # N열
+        CHART_COL_LABEL = 17  # Q열
+        CHART_COL_VAL   = 18  # R열
 
         ws.cell(row=CHART_ROW,     column=CHART_COL_LABEL).value = '구분'
         ws.cell(row=CHART_ROW,     column=CHART_COL_VAL).value   = '종목수'
@@ -928,6 +1070,9 @@ class IPOMonitor:
         ws.cell(row=CHART_ROW + 2, column=CHART_COL_VAL).value   = neutral
         ws.cell(row=CHART_ROW + 3, column=CHART_COL_LABEL).value = '약세 (D+F등급)'
         ws.cell(row=CHART_ROW + 3, column=CHART_COL_VAL).value   = weak
+
+        ws.column_dimensions['Q'].width = 16
+        ws.column_dimensions['R'].width = 10
 
         # 차트 생성
         pie = PieChart()
@@ -954,7 +1099,7 @@ class IPOMonitor:
 
         pie.width  = 13
         pie.height = 10
-        ws.add_chart(pie, 'M14')
+        ws.add_chart(pie, 'Q14')
 
     def _set_column_width(self, writer, sheet_name: str):
         """Excel 시트의 모든 컬럼 폭을 설정"""
@@ -1071,8 +1216,29 @@ class IPOMonitor:
             print(f"  RSI 히스토리 계산 오류: {e}")
             return existing if not existing.empty else pd.DataFrame(columns=['날짜', '분석종목수', 'RSI65이상', '과매수비율(%)', '전일대비'])
 
-    def save_results(self, filename: str = None) -> Path:
-        """결과를 Excel로 저장"""
+    def _load_previous_day_data(self, prev_file: str = None) -> pd.DataFrame:
+        """전일 결과 파일에서 '전체' 시트 로드 (파일명을 input으로 받음)"""
+        try:
+            if prev_file is None:
+                prev_file = input("전일 결과 파일명을 입력하세요 (예: ipo_monitoring_20260326.xlsx): ").strip()
+
+            if not prev_file:
+                print("  전일 파일 미입력 → 전일 비교 생략")
+                return None
+
+            prev_path = self.config.OUTPUT_DIR / prev_file
+            if not prev_path.exists():
+                print(f"  파일 없음: {prev_path}")
+                return None
+
+            print(f"  전일 데이터 로드: {prev_file}")
+            return pd.read_excel(prev_path, sheet_name='전체')
+        except Exception as e:
+            print(f"  전일 데이터 로드 실패: {e}")
+            return None
+
+    def save_results(self, filename: str = None, prev_file: str = None) -> Path:
+        """결과를 Excel로 저장 (prev_file: 전일 결과 파일명, 미입력 시 input으로 받음)"""
         print("\n" + "=" * 60)
         print("[Step 6] 결과 저장")
         print("=" * 60)
@@ -1107,6 +1273,13 @@ class IPOMonitor:
             # 전체
             df.to_excel(writer, sheet_name='전체', index=False)
             sheet_names.append('전체')
+
+            # 전체_전일자 시트 추가 (전일 결과 파일에서 로드)
+            prev_df = self._load_previous_day_data(prev_file)
+            has_prev_data = prev_df is not None and not prev_df.empty
+            if has_prev_data:
+                prev_df.to_excel(writer, sheet_name='전체_전일자', index=False)
+                sheet_names.append('전체_전일자')
 
             # RSI 과매도/과매수
             if 'RSI(14)' in df.columns:
@@ -1150,7 +1323,7 @@ class IPOMonitor:
                 sheet_names.append('RSI추이')
 
             # POST IPO 보고서 시트 (첫 번째 탭으로 추가)
-            self._create_report_sheet(writer, df)
+            self._create_report_sheet(writer, df, has_prev_data=has_prev_data)
 
             # 컬럼 폭 적용
             for sheet in sheet_names:
@@ -1236,14 +1409,15 @@ class IPOMonitor:
     # =========================================================================
     # 전체 실행
     # =========================================================================
-    def run(self, source: str = 'A') -> pd.DataFrame:
+    def run(self, source: str = 'A', use_prev_day: bool = False) -> pd.DataFrame:
         """전체 모니터링 프로세스 실행
         source='A': 최초상장일.xlsx (기본)
         source='B': __post ipo univ.xlsx
+        use_prev_day: True → 전일 종가 기준 (다음날 실행 시)
         """
         self.load_ipo_universe(source=source)
         self.load_supply_data()
-        self.fetch_bloomberg_data()
+        self.fetch_bloomberg_data(use_prev_day=use_prev_day)
         self.merge_data()
         self.print_summary()
         self.save_results()

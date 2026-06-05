@@ -239,6 +239,28 @@ class IPOMonitor:
         rs = avg_gain / avg_loss
         return (100 - 100 / (1 + rs)).round(2)
 
+    @staticmethod
+    def _load_market_caps() -> dict:
+        """fdr.StockListing('KRX')로 종목별 시가총액(억원) 맵 생성"""
+        import FinanceDataReader as fdr
+        try:
+            listing = fdr.StockListing('KRX')
+        except Exception as e:
+            print(f"  시가총액 로드 실패(StockListing): {e}")
+            return {}
+        code_col = next((c for c in ['Code', 'code', 'Symbol'] if c in listing.columns), None)
+        cap_col = next((c for c in ['Marcap', 'MarCap', 'marcap', '시가총액'] if c in listing.columns), None)
+        if code_col is None or cap_col is None:
+            print(f"  시가총액 컬럼 탐색 실패 (컬럼: {list(listing.columns)[:10]})")
+            return {}
+        caps = {}
+        for _, r in listing[[code_col, cap_col]].dropna().iterrows():
+            try:
+                caps[str(r[code_col]).zfill(6)] = float(r[cap_col]) / 100_000_000  # 원 → 억
+            except (ValueError, TypeError):
+                continue
+        return caps
+
     def fetch_bloomberg_data(self, use_prev_day: bool = False) -> pd.DataFrame:
         """FinanceDataReader(한국 증시 전용)로 가격, 거래량, RSI, 변동성 수집
         use_prev_day=False: 당일(T-0) 종가 기준 (장 마감 직후 실행)
@@ -284,7 +306,11 @@ class IPOMonitor:
 
         # 종목코드 추출 (A000000 → 000000)
         stock_codes = self._ipo_df['코드'].str[1:].tolist()
-        print(f"대상: {len(stock_codes)}개 종목\n")
+        print(f"대상: {len(stock_codes)}개 종목")
+
+        # 시가총액(억) 맵 — 1000억 필터용
+        mkt_caps = self._load_market_caps()
+        print(f"시가총액 로드: {len(mkt_caps)}개\n")
 
         # 기술적 지표 계산을 위해 90일(달력) 히스토리 확보
         start_date = (ref_date - pd.Timedelta(days=90)).strftime('%Y-%m-%d')
@@ -386,6 +412,7 @@ class IPOMonitor:
                         'mov_avg_20d': row.get('mov_avg_20d'),
                         'mov_avg_60d': row.get('mov_avg_60d'),
                         'bollinger_band_width': row.get('bollinger_band_width'),
+                        'cur_mkt_cap': mkt_caps.get(code),
                     })
                 except Exception:
                     continue
@@ -499,12 +526,9 @@ class IPOMonitor:
         }
         result = result.rename(columns=rename_map)
 
-        # 시가총액 단위 변환 및 1000억 미만 제외
-        # Bloomberg CUR_MKT_CAP: 백만원 단위 → 억원 = /100
+        # 시가총액 1000억 미만 제외 (FinanceDataReader StockListing 기준, 억원)
         if '시가총액(억)' in result.columns:
-            result['시가총액(억)'] = (
-                pd.to_numeric(result['시가총액(억)'], errors='coerce') / 100
-            ).round(0)
+            result['시가총액(억)'] = pd.to_numeric(result['시가총액(억)'], errors='coerce').round(0)
             before = len(result)
             result = result[result['시가총액(억)'].fillna(0) >= 1000].copy()
             print(f"  시가총액 1000억 미만 제외: {before - len(result)}개 종목 제거 → {len(result)}개 유지")

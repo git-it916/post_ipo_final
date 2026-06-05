@@ -1,16 +1,18 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Post IPO 실시간 모멘텀 스크리너
-================================
-__post ipo univ.xlsx 유니버스 내 종목을 장중 실시간으로 모니터링.
-모멘텀·수급·거래량 기반 스코어링으로 괜찮은 종목을 선별.
+Post IPO 모멘텀 스크리너 (FinanceDataReader 기반)
+================================================
+__post ipo univ.xlsx 유니버스 내 종목을 모멘텀·수급·거래량으로 스코어링.
+
+데이터 소스: FinanceDataReader — 최신 '일봉(EOD)' 기준 (장중 실시간 호가 아님).
+            RSI/이평/RVOL은 직접 계산. VWAP은 일봉으로 산출 불가하여 제외.
 
 실행:
-    python realtime_screen.py              # 기본 60초 간격
-    python realtime_screen.py --interval 30  # 30초 간격
-    python realtime_screen.py --top 30       # 상위 30개 표시
-    python realtime_screen.py --export       # 스냅샷 Excel 저장
+    python realtime_screen.py              # 기본 60초 간격 반복
+    python realtime_screen.py --once       # 1회만 실행
+    python realtime_screen.py --top 30     # 상위 30개 표시
+    python realtime_screen.py --export     # 스냅샷 Excel 저장
 """
 import sys
 import time
@@ -116,40 +118,90 @@ def load_supply_data(config: Config) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Bloomberg 실시간 스냅샷
+# FinanceDataReader 스냅샷 (최신 일봉 기준 — 장중 실시간 아님)
 # ─────────────────────────────────────────────────────────────────────────────
-def fetch_realtime_snapshot(tickers: list, batch_size: int = 50) -> pd.DataFrame:
-    """Bloomberg BDP로 현재 시점 스냅샷 수집"""
-    from xbbg import blp
+def wilder_rsi(close: pd.Series, length: int = 14) -> pd.Series:
+    """Wilder 방식 RSI(14)"""
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / length, min_periods=length, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / length, min_periods=length, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    return (100 - 100 / (1 + rs)).round(2)
 
-    fields = [
-        'LAST_PRICE',           # 현재가
-        'CHG_PCT_1D',           # 일간 등락률(%)
-        'VOLUME',               # 당일 거래량
-        'VOLUME_AVG_20D',       # 20일 평균 거래량
-        'RSI_14D',              # RSI(14)
-        'MOV_AVG_10D',          # 10일 이동평균
-        'EQY_WEIGHTED_AVG_PX',  # VWAP
-        'CUR_MKT_CAP',          # 시가총액(백만원)
-        'HIGH_1D',              # 당일 고가
-        'LOW_1D',               # 당일 저가
-        'OPEN_PX',              # 시가
-    ]
 
-    results = []
-    for i in range(0, len(tickers), batch_size):
-        batch = tickers[i:i + batch_size]
+def load_market_caps() -> dict:
+    """fdr.StockListing('KRX')로 종목별 시가총액(억원) 맵 생성"""
+    import FinanceDataReader as fdr
+    try:
+        listing = fdr.StockListing('KRX')
+    except Exception as e:
+        print(f"  시가총액 로드 실패(StockListing): {e}")
+        return {}
+    code_col = next((c for c in ['Code', 'code', 'Symbol'] if c in listing.columns), None)
+    cap_col = next((c for c in ['Marcap', 'MarCap', 'marcap', '시가총액'] if c in listing.columns), None)
+    if code_col is None or cap_col is None:
+        print(f"  시가총액 컬럼 탐색 실패 (컬럼: {list(listing.columns)[:10]})")
+        return {}
+    caps = {}
+    for _, r in listing[[code_col, cap_col]].dropna().iterrows():
         try:
-            df = blp.bdp(batch, fields)
-            if not df.empty:
-                results.append(df)
-        except Exception as e:
-            print(f"  BDP 오류 (배치 {i // batch_size + 1}): {e}")
+            caps[str(r[code_col]).zfill(6)] = float(r[cap_col]) / 100_000_000  # 원 → 억
+        except (ValueError, TypeError):
+            continue
+    return caps
 
-    if not results:
+
+def fetch_realtime_snapshot(stock_codes: list, mkt_caps: dict, batch_size: int = 50) -> pd.DataFrame:
+    """FinanceDataReader로 최신 일봉 스냅샷 수집 (인덱스 = 6자리 코드)"""
+    import FinanceDataReader as fdr
+
+    today = datetime.now()
+    start = (today - pd.Timedelta(days=60)).strftime('%Y-%m-%d')
+    end = today.strftime('%Y-%m-%d')
+
+    rows = []
+    total = len(stock_codes)
+    for n, code in enumerate(stock_codes, 1):
+        if n % 20 == 0 or n == total:
+            print(f"\r  수집 중 {n}/{total}", end='', flush=True)
+        try:
+            hist = None
+            for symbol in (f'KRX:{code}', code):
+                try:
+                    hist = fdr.DataReader(symbol, start, end)
+                    if hist is not None and not hist.empty:
+                        break
+                except Exception:
+                    hist = None
+            if hist is None or hist.empty or len(hist) < 5:
+                continue
+
+            hist.columns = hist.columns.str.lower()
+            if 'close' not in hist.columns or 'volume' not in hist.columns:
+                continue
+
+            close = hist['close']
+            volume = hist['volume']
+            last = hist.iloc[-1]
+            rows.append({
+                'code': code,
+                'last_price': last.get('close'),
+                'chg_pct_1d': round(close.pct_change().iloc[-1] * 100, 2) if len(close) >= 2 else None,
+                'volume': last.get('volume'),
+                'volume_avg_20d': volume.rolling(20).mean().iloc[-1],
+                'rsi_14d': wilder_rsi(close, 14).iloc[-1],
+                'mov_avg_10d': close.rolling(10).mean().iloc[-1],
+                '시가총액(억)': mkt_caps.get(code),
+            })
+        except Exception:
+            continue
+    print()
+
+    if not rows:
         return pd.DataFrame()
-
-    return pd.concat(results)
+    return pd.DataFrame(rows).set_index('code')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -162,18 +214,16 @@ def calculate_realtime_scores(
 ) -> pd.DataFrame:
     """모멘텀·수급·거래량 기반 실시간 스코어 계산"""
 
-    # Bloomberg 데이터 정리
+    # 스냅샷 정리 (인덱스 = 6자리 코드)
     bbg = bbg.copy()
-    bbg.columns = bbg.columns.str.lower()
-    bbg['ticker'] = bbg.index
-    bbg['코드'] = 'A' + bbg['ticker'].str.split(' ').str[0]
+    bbg['코드'] = 'A' + bbg.index.astype(str)
 
     # 유니버스와 병합
     result = univ[['코드', '코드명']].merge(bbg, on='코드', how='inner')
 
     # 시가총액 필터 (1000억 미만 제외)
-    if 'cur_mkt_cap' in result.columns:
-        result['시가총액(억)'] = (pd.to_numeric(result['cur_mkt_cap'], errors='coerce') / 100).round(0)
+    if '시가총액(억)' in result.columns:
+        result['시가총액(억)'] = pd.to_numeric(result['시가총액(억)'], errors='coerce').round(0)
         result = result[result['시가총액(억)'].fillna(0) >= 1000].copy()
 
     # RVOL 계산
@@ -444,33 +494,26 @@ def main():
     print("\n수급 데이터 로드 중...")
     supply = load_supply_data(config)
 
-    # KS/KQ 티커 준비
-    tickers_ks = univ['ticker_ks'].tolist()
+    # 시가총액 로드 (1회)
+    print("\n시가총액 로드 중...")
+    mkt_caps = load_market_caps()
+    stock_codes = univ['코드'].str[1:].tolist()
 
     cycle = 0
     try:
         while True:
             cycle += 1
 
-            # Bloomberg 스냅샷 수집
-            bbg = fetch_realtime_snapshot(tickers_ks, batch_size=config.BATCH_SIZE)
+            # FinanceDataReader 스냅샷 수집 (최신 일봉 기준)
+            snap = fetch_realtime_snapshot(stock_codes, mkt_caps, batch_size=config.BATCH_SIZE)
 
-            if bbg.empty:
-                print(f"\n  [{datetime.now().strftime('%H:%M:%S')}] Bloomberg 데이터 수집 실패. {args.interval}초 후 재시도...")
+            if snap.empty:
+                print(f"\n  [{datetime.now().strftime('%H:%M:%S')}] 데이터 수집 실패. {args.interval}초 후 재시도...")
                 time.sleep(args.interval)
                 continue
 
-            # KS에서 안 잡힌 종목 KQ 재시도
-            fetched_codes = set('A' + idx.split(' ')[0] for idx in bbg.index)
-            missing = univ[~univ['코드'].isin(fetched_codes)]
-            if not missing.empty:
-                kq_tickers = missing['ticker_kq'].tolist()
-                kq_bbg = fetch_realtime_snapshot(kq_tickers, batch_size=config.BATCH_SIZE)
-                if not kq_bbg.empty:
-                    bbg = pd.concat([bbg, kq_bbg])
-
             # 스코어 계산
-            scored = calculate_realtime_scores(univ, bbg, supply)
+            scored = calculate_realtime_scores(univ, snap, supply)
 
             if scored.empty:
                 print(f"\n  [{datetime.now().strftime('%H:%M:%S')}] 스코어 계산 결과 없음.")

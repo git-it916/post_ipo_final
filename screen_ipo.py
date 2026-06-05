@@ -1052,7 +1052,12 @@ class IPOMonitor:
         j6.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
 
         j7 = ws.cell(row=7, column=10)
-        j7.value = '=COUNTIF(전체!P2:P10000,">=65")'
+        # 컬럼 위치를 하드코딩(P열)하지 않고, 다른 수식들처럼 컬럼명으로 RSI(14) 열을 찾아 COUNTIF
+        j7.value = (
+            '=COUNTIF('
+            'INDEX(전체!$A:$XFD,0,MATCH("RSI(14)",전체!$1:$1,0)),'
+            '">=65")'
+        )
         j7.font = Font(bold=True, color=COLOR_NAVY, size=20, name='맑은 고딕')
         j7.fill = fill(COLOR_GRAY)
         j7.alignment = center()

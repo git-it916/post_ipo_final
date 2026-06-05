@@ -40,6 +40,7 @@ class IPOMonitor:
         self._bloomberg_df = None
         self._result_df = None
         self._ref_date = None
+        self._rsi_cache = {}  # {코드: RSI(14) 시계열} — RSI추이 히스토리 재사용용
 
     # =========================================================================
     # Step 1: IPO 종목 로드
@@ -224,18 +225,30 @@ class IPOMonitor:
         return supply_df
 
     # =========================================================================
-    # Step 3: Bloomberg 데이터 수집 (당일 장 마감 기준)
+    # Step 3: 가격/거래량 데이터 수집 (당일 장 마감 기준)
+    #   - Bloomberg(blpapi) 제거 → FinanceDataReader(한국 증시 공개 데이터) 기반
     # =========================================================================
+    @staticmethod
+    def _wilder_rsi(close: pd.Series, length: int = 14) -> pd.Series:
+        """Wilder 방식 RSI — Bloomberg RSI_14D와 동일한 평활(RMA) 사용"""
+        delta = close.diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.ewm(alpha=1 / length, min_periods=length, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1 / length, min_periods=length, adjust=False).mean()
+        rs = avg_gain / avg_loss
+        return (100 - 100 / (1 + rs)).round(2)
+
     def fetch_bloomberg_data(self, use_prev_day: bool = False) -> pd.DataFrame:
-        """Bloomberg에서 가격, 거래량, RSI, 변동성 수집
+        """FinanceDataReader(한국 증시 전용)로 가격, 거래량, RSI, 변동성 수집
         use_prev_day=False: 당일(T-0) 종가 기준 (장 마감 직후 실행)
         use_prev_day=True:  전일(T-1) 종가 기준 (다음날 실행)
         """
-        from xbbg import blp
+        import FinanceDataReader as fdr
 
         mode_label = '전일 종가 기준 (다음날 실행)' if use_prev_day else '당일 장 마감 기준'
         print("\n" + "=" * 60)
-        print(f"[Step 3] Bloomberg 데이터 수집 ({mode_label})")
+        print(f"[Step 3] 가격/거래량 데이터 수집 ({mode_label})")
         print("=" * 60)
 
         if self._ipo_df is None:
@@ -269,155 +282,119 @@ class IPOMonitor:
             else:
                 print(f"  수급 기준일: {supply_date_str}  |  주가 기준일: {ref_date_str}")
 
-        tickers = self._ipo_df['ticker_ks'].tolist()
+        # 종목코드 추출 (A000000 → 000000)
+        stock_codes = self._ipo_df['코드'].str[1:].tolist()
+        print(f"대상: {len(stock_codes)}개 종목\n")
 
-        # BDH용 필드 (히스토리컬) — 당일자 기준 수집
-        bdh_fields = [
-            'PX_LAST',        # 종가
-            'PX_VOLUME',      # 거래량
-            'TURNOVER',       # 거래대금 (원)
-            'CHG_PCT_1D',     # 일간 등락률(%)
-            'RSI_14D',        # RSI(14)
-        ]
-
-        # BDP용 필드 (스냅샷/기술적 지표)
-        bdp_fields = [
-            'VOLUME_AVG_20D',          # 20일 평균 거래량
-            'VOLATILITY_30D',          # 30일 변동성
-            'MOV_AVG_10D',             # 10일 이동평균
-            'MOV_AVG_20D',             # 20일 이동평균
-            'MOV_AVG_60D',             # 60일 이동평균
-            'BOLLINGER_BAND_WIDTH',    # 볼린저밴드 폭
-            'CUR_MKT_CAP',            # 시가총액 (백만원)
-            'EQY_FREE_FLOAT_PCT',     # 유통비율(%)
-            'SHORT_INT_RATIO',        # 공매도 비율
-        ]
-
-        print(f"대상: {len(tickers)}개 종목\n")
+        # 기술적 지표 계산을 위해 90일(달력) 히스토리 확보
+        start_date = (ref_date - pd.Timedelta(days=90)).strftime('%Y-%m-%d')
+        end_date = ref_date_str
 
         results = []
+        self._rsi_cache = {}
         batch_size = self.config.BATCH_SIZE
-        total_batches = (len(tickers) + batch_size - 1) // batch_size
+        total_batches = (len(stock_codes) + batch_size - 1) // batch_size
 
-        # BDH: 전일 가격/거래량 데이터
-        for i in range(0, len(tickers), batch_size):
-            batch = tickers[i:i + batch_size]
+        for i in range(0, len(stock_codes), batch_size):
+            batch_codes = stock_codes[i:i + batch_size]
             batch_num = i // batch_size + 1
+            print_progress_bar(batch_num, total_batches, prefix='데이터 수집')
 
-            print_progress_bar(batch_num, total_batches, prefix='BDH 수집')
+            for code in batch_codes:
+                try:
+                    # FinanceDataReader: KRX 접두형 우선, 실패 시 기본 코드로 재시도
+                    hist = None
+                    for symbol in (f'KRX:{code}', code):
+                        try:
+                            hist = fdr.DataReader(symbol, start_date, end_date)
+                            if hist is not None and not hist.empty:
+                                break
+                        except Exception:
+                            hist = None
 
-            try:
-                hist_data = blp.bdh(batch, bdh_fields, ref_date_str, ref_date_str)
-                if not hist_data.empty:
-                    # BDH 결과: 인덱스=날짜, 컬럼=MultiIndex(ticker, field)
-                    # 우리가 원하는 형태: 인덱스=ticker, 컬럼=field
+                    if hist is None or hist.empty or len(hist) < 5:
+                        continue
 
-                    # 멀티레벨 컬럼인 경우 (ticker, field) 구조
-                    if hist_data.columns.nlevels > 1:
-                        # 첫 번째 행(날짜) 데이터를 unstack하고 전치
-                        hist_flat = hist_data.iloc[0].unstack(level=0).T
+                    hist.columns = hist.columns.str.lower()
+                    if 'close' not in hist.columns or 'volume' not in hist.columns:
+                        continue
+
+                    close = hist['close']
+                    volume = hist['volume']
+
+                    # 기술적 지표
+                    hist['rsi_14d'] = self._wilder_rsi(close, 14)
+                    hist['mov_avg_10d'] = close.rolling(10).mean()
+                    hist['mov_avg_20d'] = close.rolling(20).mean()
+                    hist['mov_avg_60d'] = close.rolling(60).mean()
+
+                    # 볼린저밴드 폭 (20일, ±2σ) = 상단 - 하단 = 4σ
+                    sd20 = close.rolling(20).std(ddof=0)
+                    hist['bollinger_band_width'] = (sd20 * 4).round(2)
+
+                    # 변동성: 일간수익률 30일 표준편차(%)
+                    hist['volatility_30d'] = (close.pct_change().rolling(30).std() * 100).round(2)
+
+                    # 거래량 지표
+                    hist['volume_avg_20d'] = volume.rolling(20).mean()
+                    hist['rvol_20'] = (volume / hist['volume_avg_20d']).round(2)
+
+                    # 수익률
+                    hist['chg_pct_1d'] = (close.pct_change() * 100).round(2)
+                    hist['chg_pct_20d'] = (((close - close.shift(20)) / close.shift(20)) * 100).round(2)
+
+                    # RSI추이 히스토리 재사용을 위해 RSI 시계열 캐시
+                    self._rsi_cache[code] = hist['rsi_14d']
+
+                    # 기준일 위치 결정 (당일=마지막, 전일=ref_date 이하 마지막)
+                    if use_prev_day:
+                        positions = [k for k, d in enumerate(hist.index)
+                                     if d.strftime('%Y-%m-%d') <= ref_date_str]
+                        if not positions:
+                            continue
+                        pos = positions[-1]
                     else:
-                        # 단일 티커인 경우
-                        hist_flat = hist_data.T
-                        hist_flat.index = batch[:len(hist_flat)]
+                        pos = len(hist) - 1
 
-                    if not hist_flat.empty:
-                        results.append(hist_flat)
-            except Exception as e:
-                print(f"\n  ⚠️ BDH 오류 (배치 {batch_num}): {e}")
+                    row = hist.iloc[pos]
+                    cur_rsi = row.get('rsi_14d')
+                    prev_rsi = hist['rsi_14d'].iloc[pos - 1] if pos >= 1 else None
+                    if pd.notna(cur_rsi) and prev_rsi is not None and pd.notna(prev_rsi):
+                        rsi_change = round(float(cur_rsi) - float(prev_rsi), 1)
+                    else:
+                        rsi_change = None
 
-        # BDP: 기술적 지표 수집
-        bdp_results = []
-        for i in range(0, len(tickers), batch_size):
-            batch = tickers[i:i + batch_size]
-            batch_num = i // batch_size + 1
+                    close_v = row.get('close')
+                    vol_v = row.get('volume')
+                    turnover = (round((close_v * vol_v) / 100_000_000, 1)
+                                if (pd.notna(close_v) and pd.notna(vol_v)) else None)
 
-            print_progress_bar(batch_num, total_batches, prefix='BDP 수집')
+                    results.append({
+                        'ticker': code,
+                        'px_last': close_v,
+                        'px_volume': vol_v,
+                        'turnover': turnover,
+                        'chg_pct_1d': row.get('chg_pct_1d'),
+                        'chg_pct_20d': row.get('chg_pct_20d'),
+                        'rsi_14d': cur_rsi,
+                        'rsi_prev': prev_rsi,
+                        'rsi_change': rsi_change,
+                        'volume_avg_20d': row.get('volume_avg_20d'),
+                        'rvol_20': row.get('rvol_20'),
+                        'volatility_30d': row.get('volatility_30d'),
+                        'mov_avg_10d': row.get('mov_avg_10d'),
+                        'mov_avg_20d': row.get('mov_avg_20d'),
+                        'mov_avg_60d': row.get('mov_avg_60d'),
+                        'bollinger_band_width': row.get('bollinger_band_width'),
+                    })
+                except Exception:
+                    continue
 
-            try:
-                bdp_data = blp.bdp(batch, bdp_fields)
-                if not bdp_data.empty:
-                    bdp_results.append(bdp_data)
-            except Exception as e:
-                print(f"\n  ⚠️ BDP 오류 (배치 {batch_num}): {e}")
-
-        # 결과 병합
         if not results:
-            print("BDH 데이터 수집 실패")
+            print("\n데이터 수집 실패")
             return pd.DataFrame()
 
-        df_hist = pd.concat(results)
-
-        if bdp_results:
-            df_bdp = pd.concat(bdp_results)
-            df = df_hist.join(df_bdp, how='left')
-        else:
-            print("  ⚠️ BDP 데이터 없음")
-            df = df_hist
-
-        # 20일 수익률 BDH로 직접 계산
-        print_progress_bar(1, 1, prefix='20일수익률 계산')
-        try:
-            # 30 calendar days → 영업일 20일 확보
-            start_20d = (ref_date - pd.Timedelta(days=32)).strftime('%Y-%m-%d')
-            price_hist = blp.bdh(tickers, 'PX_LAST', start_20d, ref_date_str)
-
-            if not price_hist.empty and price_hist.columns.nlevels > 1:
-                # 컬럼: MultiIndex(ticker, 'PX_LAST') → ticker만
-                price_hist.columns = price_hist.columns.droplevel(1)
-
-            if not price_hist.empty and len(price_hist) >= 2:
-                # 20영업일 전 가격 (최소 인덱스 기준 앞에서 첫 번째)
-                available_days = len(price_hist)
-                lookback = min(20, available_days - 1)
-                price_now = price_hist.iloc[-1]       # 당일 가격
-                price_20d = price_hist.iloc[-1 - lookback]  # 20영업일 전 가격
-                chg_20d = ((price_now - price_20d) / price_20d * 100).round(2)
-                df['chg_pct_20d'] = chg_20d.reindex(df.index)
-        except Exception as e:
-            print(f"\n  ⚠️ 20일수익률 계산 오류: {e}")
-
-        # KS로 안 되는 종목은 KQ로 재시도
-        missing = [t for t in tickers if t not in df.index]
-        if missing:
-            print(f"\nKOSDAQ 티커로 재시도: {len(missing)}개")
-            kq_tickers = [t.replace(' KS ', ' KQ ') for t in missing]
-
-            try:
-                kq_hist = blp.bdh(kq_tickers, bdh_fields, ref_date_str, ref_date_str)
-                kq_bdp = blp.bdp(kq_tickers, bdp_fields)
-
-                if not kq_hist.empty:
-                    # 멀티레벨 컬럼인 경우
-                    if kq_hist.columns.nlevels > 1:
-                        kq_flat = kq_hist.iloc[0].unstack(level=0).T
-                    else:
-                        kq_flat = kq_hist.T
-                        kq_flat.index = kq_tickers[:len(kq_flat)]
-
-                    if not kq_bdp.empty:
-                        kq_flat = kq_flat.join(kq_bdp, how='left')
-                    df = pd.concat([df, kq_flat])
-            except Exception as e:
-                print(f"  KQ 재시도 오류: {e}")
-
-        # 컬럼명 소문자로
-        df.columns = df.columns.str.lower()
-
-        # RVOL(20) 계산: 당일거래량 / 20일평균거래량
-        if 'px_volume' in df.columns and 'volume_avg_20d' in df.columns:
-            df['rvol_20'] = (
-                df['px_volume'] / df['volume_avg_20d']
-            ).round(2)
-
-        # 거래대금 억원 변환
-        if 'turnover' in df.columns:
-            df['turnover'] = (
-                pd.to_numeric(df['turnover'], errors='coerce') / 100_000_000
-            ).round(1)
-
-        # 전일 RSI 가져오기
-        df = self._fetch_previous_rsi(df, tickers, ref_date)
+        df = pd.DataFrame(results).set_index('ticker')
 
         # 이동평균선 돌파 여부
         if 'px_last' in df.columns and 'mov_avg_10d' in df.columns:
@@ -427,66 +404,14 @@ class IPOMonitor:
         if 'px_last' in df.columns and 'mov_avg_60d' in df.columns:
             df['above_ma60'] = (df['px_last'] > df['mov_avg_60d']).astype(int)
 
-        self._bloomberg_df = df.reset_index().rename(columns={'index': 'ticker'})
+        self._bloomberg_df = df
 
-        print(f"\nBloomberg 데이터: {len(df)}개 종목 (기준일: {ref_date_str})")
+        print(f"\n수집 완료: {len(df)}개 종목 (기준일: {ref_date_str})")
 
-        # Bloomberg 원본 데이터 저장
+        # 원본 데이터 저장
         self._save_bloomberg_raw_data(ref_date_str)
 
         return self._bloomberg_df
-
-    def _fetch_previous_rsi(self, df: pd.DataFrame, tickers: list, ref_date) -> pd.DataFrame:
-        """전일 RSI를 가져와서 RSI 변화량 계산"""
-        from xbbg import blp
-
-        # 전일(T-2) 날짜 계산
-        prev_date = ref_date - pd.Timedelta(days=1)
-        # 주말/공휴일 처리
-        while prev_date.strftime('%Y-%m-%d') in self.config.KR_HOLIDAYS or prev_date.weekday() >= 5:
-            prev_date = prev_date - pd.Timedelta(days=1)
-
-        prev_date_str = prev_date.strftime('%Y-%m-%d')
-
-        try:
-            print(f"\n  전일 RSI 수집 중 ({prev_date_str})...")
-            prev_rsi = blp.bdh(tickers, 'RSI_14D', prev_date_str, prev_date_str)
-
-            if prev_rsi.empty:
-                print("    전일 RSI 데이터 없음")
-                return df
-
-            # 멀티인덱스 처리 (BDH: index=날짜, columns=MultiIndex(ticker, field))
-            if prev_rsi.columns.nlevels > 1:
-                # (ticker, field) → tickers를 행으로, field를 열로
-                prev_rsi_flat = prev_rsi.iloc[0].unstack(level=0).T
-                # RSI_14D 열 추출 후 숫자 변환
-                col = [c for c in prev_rsi_flat.columns if 'RSI' in str(c).upper()]
-                if col:
-                    prev_rsi_series = pd.to_numeric(prev_rsi_flat[col[0]], errors='coerce')
-                else:
-                    prev_rsi_series = pd.to_numeric(prev_rsi_flat.iloc[:, 0], errors='coerce')
-            else:
-                prev_rsi_series = pd.to_numeric(prev_rsi.iloc[0], errors='coerce')
-
-            # 전일 RSI 컬럼 추가
-            df['rsi_prev'] = pd.to_numeric(
-                df.index.map(lambda x: prev_rsi_series.get(x, None)), errors='coerce'
-            )
-
-            # RSI 변화량 계산 (당일 RSI - 전일 RSI)
-            if 'rsi_14d' in df.columns:
-                df['rsi_change'] = (
-                    pd.to_numeric(df['rsi_14d'], errors='coerce') -
-                    pd.to_numeric(df['rsi_prev'], errors='coerce')
-                ).round(1)
-
-            print(f"    전일 RSI 수집 완료")
-
-        except Exception as e:
-            print(f"    전일 RSI 수집 오류: {e}")
-
-        return df
 
     def _save_bloomberg_raw_data(self, ref_date_str: str):
         """Bloomberg 원본 데이터를 Excel로 저장"""
@@ -501,8 +426,8 @@ class IPOMonitor:
         filepath = raw_data_dir / filename
 
         try:
-            self._bloomberg_df.to_excel(filepath, index=False, sheet_name='Bloomberg_Data')
-            print(f"  Bloomberg 원본 저장: {filepath}")
+            self._bloomberg_df.reset_index().to_excel(filepath, index=False, sheet_name='RawData')
+            print(f"  원본 데이터 저장: {filepath}")
         except Exception as e:
             print(f"  Bloomberg 원본 저장 실패: {e}")
 
@@ -532,7 +457,7 @@ class IPOMonitor:
         # Bloomberg 데이터 병합
         if self._bloomberg_df is not None and not self._bloomberg_df.empty:
             bbg = self._bloomberg_df.copy()
-            bbg['코드'] = 'A' + bbg['ticker'].str.split(' ').str[0]
+            bbg['코드'] = 'A' + bbg.index.astype(str)
 
             bbg_cols = ['코드', 'px_last', 'px_volume', 'turnover', 'volume_avg_20d', 'rvol_20',
                         'volatility_30d', 'rsi_14d', 'rsi_prev', 'rsi_change',
@@ -1137,70 +1062,58 @@ class IPOMonitor:
             return pd.DataFrame(columns=['날짜', '분석종목수', 'RSI65이상', '과매수비율(%)', '전일대비'])
 
     def _calculate_rsi_history(self) -> pd.DataFrame:
-        """RSI 65 이상 종목수 히스토리 (평소: 당일만, 초기: 30일 채움)"""
-        from xbbg import blp
+        """RSI 65 이상 종목수 일별 히스토리 (Step 3에서 캐시한 RSI 시계열 재사용)"""
+        cols = ['날짜', '분석종목수', 'RSI65이상', '과매수비율(%)', '전일대비']
 
-        if self._ipo_df is None:
-            return pd.DataFrame(columns=['날짜', '분석종목수', 'RSI65이상', '과매수비율(%)', '전일대비'])
-
-        tickers = self._ipo_df['ticker_ks'].tolist()
         end_date = self._ref_date if self._ref_date else datetime.now()
         end_str = end_date.strftime('%Y-%m-%d')
 
         # 1. 기존 히스토리 로드
         existing = self._load_rsi_history_from_excel()
-
-        # 2. 초기 실행 여부 확인 (기존 데이터가 5개 미만이면 초기로 간주)
         is_initial = len(existing) < 5
 
         if is_initial:
-            # 초기: 30일 히스토리 채우기
             print(f"\nRSI 히스토리 초기화 ({self.config.RSI_CALC_DAYS}일 계산)...")
-            start_date = end_date - pd.Timedelta(days=45)
-            start_str = start_date.strftime('%Y-%m-%d')
         else:
-            # 평소: 당일만 계산
             print(f"\nRSI 히스토리 업데이트 (당일)...")
-            start_str = end_str
+
+        # 2. 캐시된 RSI 시계열로 날짜×종목 행렬 구성 (네트워크 재요청 없음)
+        if not self._rsi_cache:
+            print("  RSI 캐시 없음")
+            return existing if not existing.empty else pd.DataFrame(columns=cols)
 
         try:
-            rsi_data = blp.bdh(tickers, 'RSI_14D', start_str, end_str)
+            rsi_matrix = pd.DataFrame(self._rsi_cache).sort_index()
+            rsi_matrix = rsi_matrix[rsi_matrix.index <= pd.to_datetime(end_date)]
+            if rsi_matrix.empty:
+                return existing if not existing.empty else pd.DataFrame(columns=cols)
 
-            if rsi_data.empty:
-                print("  RSI 데이터 없음")
-                return existing if not existing.empty else pd.DataFrame(columns=['날짜', '분석종목수', 'RSI65이상', '과매수비율(%)', '전일대비'])
+            if is_initial:
+                target_dates = list(rsi_matrix.index)[-self.config.RSI_CALC_DAYS:]
+            else:
+                target_dates = [rsi_matrix.index[-1]]
 
-            # 멀티인덱스 처리
-            if rsi_data.columns.nlevels > 1:
-                rsi_data.columns = rsi_data.columns.droplevel(1)
-
-            # 각 날짜별 RSI 65 이상 종목수 계산
             calc_results = []
-            for date in rsi_data.index:
-                row_data = rsi_data.loc[date]
-                valid_count = row_data.notna().sum()  # RSI 데이터가 있는 종목 수
-                overbought_count = (row_data >= self.config.RSI_THRESHOLD).sum()
+            for date in target_dates:
+                row_data = rsi_matrix.loc[date]
+                valid_count = int(row_data.notna().sum())
+                overbought_count = int((row_data >= self.config.RSI_THRESHOLD).sum())
                 ratio = (overbought_count / valid_count * 100) if valid_count > 0 else 0
                 calc_results.append({
                     '날짜': pd.to_datetime(date),
-                    '분석종목수': int(valid_count),
-                    'RSI65이상': int(overbought_count),
-                    '과매수비율(%)': round(ratio, 1)
+                    '분석종목수': valid_count,
+                    'RSI65이상': overbought_count,
+                    '과매수비율(%)': round(ratio, 1),
                 })
 
             calculated = pd.DataFrame(calc_results)
 
             if is_initial:
-                # 초기: 30일만 유지
-                calculated = calculated.tail(self.config.RSI_CALC_DAYS)
                 print(f"  초기 {len(calculated)}일 계산 완료")
                 history = calculated
             else:
-                # 평소: 기존 + 당일 병합
                 print(f"  당일 데이터 추가")
-                # 당일 날짜가 이미 있으면 제거
-                today_str = end_str
-                existing = existing[existing['날짜'].dt.strftime('%Y-%m-%d') != today_str]
+                existing = existing[existing['날짜'].dt.strftime('%Y-%m-%d') != end_str]
                 history = pd.concat([existing, calculated], ignore_index=True)
 
             # 날짜순 정렬
@@ -1214,12 +1127,11 @@ class IPOMonitor:
             history['전일대비'] = history['RSI65이상'].diff().fillna(0).astype(int)
 
             print(f"  RSI 히스토리 총 {len(history)}일")
-
             return history
 
         except Exception as e:
             print(f"  RSI 히스토리 계산 오류: {e}")
-            return existing if not existing.empty else pd.DataFrame(columns=['날짜', '분석종목수', 'RSI65이상', '과매수비율(%)', '전일대비'])
+            return existing if not existing.empty else pd.DataFrame(columns=cols)
 
     def _load_previous_day_data(self, prev_file: str = None) -> pd.DataFrame:
         """전일 결과 파일에서 '전체' 시트 로드 (파일명을 input으로 받음)"""

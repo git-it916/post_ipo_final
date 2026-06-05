@@ -13,36 +13,33 @@ class Config:
 
     # ==========================================================================
     # 파일 경로
+    # 모든 입력/출력 경로는 프로젝트 폴더 하위의 output/ 으로 고정 (실행 위치 무관)
     # ==========================================================================
     BASE_DIR: Path = field(default_factory=lambda: Path(__file__).parent.parent)
 
     @property
-    def PARENT_DIR(self) -> Path:
-        """상위 디렉토리 (ssh_project/)"""
-        return self.BASE_DIR.parent
-
-    @property
     def OUTPUT_DIR(self) -> Path:
-        return self.PARENT_DIR / "POST IPO 결과"
+        """입력/출력 공통 디렉토리 (프로젝트/output)"""
+        return self.BASE_DIR / "output"
 
     @property
     def LOG_DIR(self) -> Path:
-        return self.BASE_DIR / "logs"
+        return self.OUTPUT_DIR / "logs"
 
     @property
     def IPO_FILE(self) -> Path:
         """최초상장일.xlsx 파일 경로"""
-        return self.PARENT_DIR / "최초상장일.xlsx"
+        return self.OUTPUT_DIR / "최초상장일.xlsx"
 
     @property
     def SUPPLY_FILE(self) -> Path:
         """수급.xlsx 파일 경로"""
-        return self.PARENT_DIR / "수급.xlsx"
+        return self.OUTPUT_DIR / "수급.xlsx"
 
     @property
     def UNIV_FILE(self) -> Path:
         """__post ipo univ.xlsx 파일 경로 (버전 B용)"""
-        return self.BASE_DIR / "__post ipo univ.xlsx"
+        return self.OUTPUT_DIR / "__post ipo univ.xlsx"
 
     # RSI 추적 설정
     RSI_THRESHOLD: int = 65  # RSI 기준값
